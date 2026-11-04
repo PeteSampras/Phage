@@ -10,6 +10,14 @@ config file.** Out of the box the fork learns, then alerts.
 Upstream's MIT `LICENSE` and copyright notice are unchanged. The commits on top
 of `9757354` record every change.
 
+> **Recommendation: keep `enforcement.self_heal` disabled** until the sensor
+> records the dev+ino of the inode that was actually opened for writing
+> (in-kernel, from `f_inode`). Two gaps remain until then (see Known open
+> items): a writer holding an open fd can over-mount its own view to defeat
+> the inode check, and data written later through an fd opened earlier is
+> never seen. Alert-only (shadow) use — learn/alert, or enforce without
+> `self_heal` — does not depend on any of this.
+
 ## Default posture
 
 | Mode | What it does |
@@ -104,7 +112,7 @@ created 0600.
   - `action`: the rung actually applied;
   - `outcome`: `contained`, `notified`, `skipped:<why>` or `failed:<err>`.
 
-  `phage events` shows the same fields. A write by a process that is already
+  `phage events` shows the same fields. A write-open by a process that is already
   contained still gets a response record, with `outcome: already_contained`.
 - **Self-heal records** (`kind: self_heal`), one per heal attempt: `outcome`
   is `healed`, `unchanged` or `failed:<err>`, along with the `path`, the
@@ -121,7 +129,14 @@ the following becomes a crash loop that leaves the host **unmonitored**:
 - a config file that does not load: YAML errors, unknown keys, non-literal
   booleans, an invalid combination, or a missing file;
 - a removed flag (`-heal`, `-protect`, `-honeytokens`) left in a drop-in;
-- a `-mode` that would raise the file's mode.
+- a `-mode` that would raise the file's mode;
+- a corrupt baseline (`/var/lib/phage/baseline.json` that is not valid JSON —
+  e.g. truncated by a full disk). A *missing* baseline is fine (fresh host);
+  to recover, move the bad file aside (this restarts learning);
+- the eBPF sensor object failing to load (missing/wrong `-bpf` path, a kernel
+  without BTF, or missing privileges). The optional objects (network
+  quarantine, self-protect) only make their feature `failed`; they do not stop
+  startup.
 
 Alert on it: watch `systemctl show -p NRestarts,ActiveState phage` (or the
 node-exporter systemd collector), or add an `OnFailure=` unit that pages, and
@@ -157,9 +172,13 @@ docs moved together). `git log 9757354..` lists each commit.
      followed, but it is replaced. The evidence copy is truncated, or records
      the symlink's target. Only a directory at the path is refused.
    - Only one heal per file can be pending at a time.
-   - The quarantine directory is capped at 64 MiB. The oldest evidence is
-     pruned first, and each prune is logged.
-3. **Self-heal triggered by writes in another mount namespace.** A container
+   - The quarantine directory is capped at 64 MiB, split into two pools that
+     are pruned independently, oldest mtime first, with each prune logged.
+     Evidence for root-owned sentinels goes in one pool and evidence for
+     user-owned ones in the other, so a user rewriting their own
+     `authorized_keys` can never evict the evidence of an attack on a
+     root-owned file.
+3. **Self-heal triggered by write-opens in another mount namespace.** A container
    writing its own `/root/.ssh/authorized_keys` produced the same path as the
    host's file. A mount-namespace comparison (the first fix) was wrong in the
    other direction: `unshare -Urm sh -c 'echo k >> ~/.ssh/authorized_keys'`
@@ -169,13 +188,21 @@ docs moved together). `git log 9757354..` lists each commit.
    - If that is the host file's dev+ino, the heal runs.
    - If it is a different file (the container's own copy), the host file is
      not touched, and the response reason records the skip.
-   - If the writer has exited or its view cannot be read, the heal runs and
-     the host file's own content decides: Heal compares the file with its
-     snapshot and does nothing if it is unchanged, which is the case when a
-     container wrote only its private copy.
+   - If the writer has exited or its view cannot be read, the heal runs
+     **only if the writer could have written the host file**: its real uid in
+     the init namespace (from the kernel event) must be 0 or the sentinel's
+     owner. Then the host file's content decides; Heal does nothing if the
+     file is unchanged. Without the uid check (as in round 2), an unprivileged
+     user in `unshare -Urm` could put a tmpfs over the directory, write and
+     delete a private copy, and make the agent revert an admin's later edit,
+     e.g. reinstate a revoked key. The file sensor does not record euid/fsuid
+     for file events, so only the real uid can be checked; a setuid-root
+     writer started by a user is therefore not healed by this fallback, though
+     it is still alerted.
 
-   Writes that arrive during a running heal set a dirty bit, so the heal runs
-   once more rather than missing them. Every heal attempt is audited.
+   Write-open events that arrive during a running heal set a dirty bit, so
+   the heal runs once more rather than missing them. Every heal attempt is
+   audited.
 4. **MEDIUM: trust was based on `comm`, which the attacker controls.**
    - The agent now recognises itself by its own tgid.
    - Only **pid 1** counts as the supervisor. The launcher is trusted only when
@@ -250,17 +277,28 @@ mean to use it by hand.
   the kernel's `dev_t` encoding. The objects compile here (clang, libbpf 1.3,
   vmlinux.h from `bpftool btf dump`), but this sandbox refuses BPF loads
   (EPERM), so the change could not be verified and was not made.
-- **Self-heal for a writer that has already exited relies on content.** If the
-  writer has gone (for example `cat >> file`), its view of the path cannot be
-  checked, so the heal runs whenever the host file differs from its snapshot.
-  A container's private write cannot change the host file, so it is not
-  reverted. But a host edit that scored below `contain`, followed by a
-  high-scoring write from a writer that has already exited, is reverted along
-  with the attacker's write (see the next item). Recording the written inode
-  in-kernel would remove this, but needs a BPF change, which was not made for
-  the same reason.
+- **N1: a writer holding an open fd can defeat the self-heal gate.** The gate
+  resolves the path in the writer's root *when the event is handled*. A writer
+  can open the host file, then over-mount its own view (`unshare -Urm`, tmpfs
+  over the directory) and create a private file at the same path. The gate
+  then sees "a different file" and skips the heal, while the attacker's data
+  sits in the host file through the fd it already holds. The alert still
+  fires. The fix is for the sensor to record the dev+ino of the opened inode
+  (`file->f_inode`) and compare that with the host file, which needs a BPF
+  change. This is why self-heal should stay off (see the recommendation at
+  the top).
+- **N2: the sensor reports write-opens, not writes.** An event is an `open`
+  with write intent. Data written later through an fd opened earlier, before
+  the heal ran or after it, raises no new event and is never healed. The
+  write-open itself is alerted. Closing this needs write-path or close-time
+  hooks in-kernel.
+- **Self-heal for a writer that has already exited** heals only for a root or
+  file-owner uid, and then lets the host file's content decide. A host edit
+  that scored below `contain`, followed by a high-scoring write-open from such
+  a writer, is reverted along with the attacker's write (see the next item).
+  Recording the opened inode and the euid/fsuid in-kernel would remove this.
 - **Snapshots are fixed at startup.** A legitimate edit to a sentinel (one that
-  scored below `contain`) is not folded into the snapshot. If a later write to
+  scored below `contain`) is not folded into the snapshot. If a later write-open to
   the same file scores high, the heal restores the *startup* content and undoes
   the legitimate edit too; the edited version is kept as evidence. After
   editing sentinel files on a host with self-heal armed, restart phaged.
@@ -268,6 +306,12 @@ mean to use it by hand.
   `init`, `login`, `getty`, `agetty`, `systemd-logind`, `dbus-daemon` and
   `systemd-journal`. A payload using one of these names avoids containment,
   though it is still alerted. Unlike sshd, these have no inode check yet.
+- **N5: dropped custom decoys stay on disk.** A leftover honeytoken record is
+  cleaned up only if its content hash matches a decoy this build plants (so a
+  tampered record cannot get an arbitrary file deleted). A custom decoy that
+  is later removed from the decoy list therefore stays on disk, with its
+  record logged as "unknown content hash". Delete such files by hand. The
+  built-in decoys are always cleaned up.
 - **SELinux.** Copying `security.selinux` is tested where the xattr can be set.
   The restore was not run on an SELinux-enforcing host.
 - **No end-to-end run.** The full daemon could not be started here, because
