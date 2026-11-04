@@ -293,7 +293,7 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 	// not stop the restore.
 	var qpath string
 	if len(evidence) > 0 {
-		qpath = saveEvidence(quarantine, path, evidence, quota)
+		qpath = saveEvidence(quarantine, path, evidence, quota, snap.uid == 0)
 	}
 
 	// Stage the restored copy NEXT TO the target, through the verified parent
@@ -320,7 +320,13 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 // saveEvidence writes one evidence file into the quarantine dir and prunes the
 // oldest evidence past quota. It returns the evidence path, or "" (logged) if
 // it could not be kept.
-func saveEvidence(quarantine, path string, evidence []byte, quota int64) string {
+//
+// Evidence is kept in two pools that are pruned independently, each against
+// half the quota: evidence for root-owned sentinels ("r-" names) and for
+// user-owned ones ("u-"). A user who can write their own authorized_keys at
+// will can therefore never evict the evidence of an attack on a root-owned
+// file. (Names without a pool prefix, from older versions, count as root.)
+func saveEvidence(quarantine, path string, evidence []byte, quota int64, rootOwned bool) string {
 	qfd, err := openNoSymlinks(quarantine, unix.O_RDONLY|unix.O_DIRECTORY)
 	if err == nil {
 		err = vetQuarantineFd(quarantine, qfd)
@@ -334,13 +340,17 @@ func saveEvidence(quarantine, path string, evidence []byte, quota int64) string 
 	}
 	defer unix.Close(qfd)
 	// Zero-padded nanoseconds first, so name order is age order for pruning.
-	name := fmt.Sprintf("%020d-%s", time.Now().UnixNano(), sanitize(path))
+	pool := userPool
+	if rootOwned {
+		pool = rootPool
+	}
+	name := fmt.Sprintf("%s%020d-%s", pool, time.Now().UnixNano(), sanitize(path))
 	n, err := writeExcl(qfd, name, evidence, os.Getuid(), os.Getgid(), 0o600, nil)
 	if err != nil {
 		log.Printf("self-heal %q: evidence not saved: %v", path, err)
 		return ""
 	}
-	pruneQuarantine(quarantine, qfd, quota, n)
+	pruneQuarantine(quarantine, qfd, quota/2, n, pool)
 	return filepath.Join(quarantine, n)
 }
 
@@ -349,10 +359,23 @@ func saveEvidence(quarantine, path string, evidence []byte, quota int64) string 
 // deletes them and does not count them against the quota.
 const stagePrefix = ".stage-"
 
-// pruneQuarantine deletes the oldest evidence files (by mtime) until the
-// directory holds at most quota bytes, never deleting keep (the file just
-// written).
-func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
+// Evidence pools (name prefixes).
+const (
+	rootPool = "r-"
+	userPool = "u-"
+)
+
+func poolOf(name string) string {
+	if strings.HasPrefix(name, userPool) {
+		return userPool
+	}
+	return rootPool // "r-" and unprefixed legacy evidence
+}
+
+// pruneQuarantine deletes the oldest evidence files (by mtime) of one pool
+// until that pool holds at most quota bytes, never deleting keep (the file
+// just written) and never touching the other pool.
+func pruneQuarantine(quarantine string, qfd int, quota int64, keep, pool string) {
 	dup, err := unix.Dup(qfd)
 	if err != nil {
 		return
@@ -381,6 +404,9 @@ func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 			}
 			continue
 		}
+		if poolOf(n) != pool {
+			continue
+		}
 		ents = append(ents, ent{n, st.Size, st.Mtim.Nano()})
 		total += st.Size
 	}
@@ -399,7 +425,7 @@ func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 		}
 		if err := unix.Unlinkat(qfd, e.name, 0); err == nil {
 			total -= e.size
-			log.Printf("self-heal: quarantine over %d bytes: pruned oldest evidence %q (%d bytes)", quota, e.name, e.size)
+			log.Printf("self-heal: %s evidence pool over %d bytes: pruned oldest evidence %q (%d bytes)", pool, quota, e.name, e.size)
 		}
 	}
 }

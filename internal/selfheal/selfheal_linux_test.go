@@ -241,7 +241,7 @@ func TestClaimDirtyBitReruns(t *testing.T) {
 func TestQuarantineQuotaPrunesOldest(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
-	f.store.quotaBytes = 3000
+	f.store.quotaBytes = 6000 // 3000 per pool
 	var kept []string
 	for i := 0; i < 5; i++ {
 		writeFile(t, f.target, strings.Repeat("x", 1000)+string(rune('a'+i)), 0o640)
@@ -278,9 +278,9 @@ func TestPruneByMtimeAndCleanStaging(t *testing.T) {
 		name string
 		age  time.Duration
 	}{
-		{"a-newest", 1 * time.Minute}, // name sorts first, but it is the newest
-		{"m-middle", 2 * time.Hour},
-		{"z-oldest", 5 * time.Hour}, // name sorts last, but it is the oldest
+		{"r-a-newest", 1 * time.Minute}, // name sorts first, but it is the newest
+		{"r-m-middle", 2 * time.Hour},
+		{"r-z-oldest", 5 * time.Hour}, // name sorts last, but it is the oldest
 	}
 	for _, e := range files {
 		p := filepath.Join(f.quarantine, e.name)
@@ -296,15 +296,15 @@ func TestPruneByMtimeAndCleanStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(qfd)
-	pruneQuarantine(f.quarantine, qfd, 2000, "")
+	pruneQuarantine(f.quarantine, qfd, 2000, "", rootPool)
 
 	if _, err := os.Stat(stage); err == nil {
 		t.Error("leftover .stage-* file must be removed")
 	}
-	if _, err := os.Stat(filepath.Join(f.quarantine, "z-oldest")); err == nil {
+	if _, err := os.Stat(filepath.Join(f.quarantine, "r-z-oldest")); err == nil {
 		t.Error("the oldest evidence by mtime must be pruned first")
 	}
-	for _, keep := range []string{"a-newest", "m-middle"} {
+	for _, keep := range []string{"r-a-newest", "r-m-middle"} {
 		if _, err := os.Stat(filepath.Join(f.quarantine, keep)); err != nil {
 			t.Errorf("%s pruned; only enough of the oldest to meet the quota should go (staging must not count)", keep)
 		}
@@ -510,5 +510,51 @@ func TestHealRefusesParentChownedAfterSnapshot(t *testing.T) {
 	writeFile(t, f.target, "evil\n", 0o640)
 	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal under a third user's dir: err = %v, want ErrUnsafe", err)
+	}
+}
+
+// N3: a user who can rewrite their own sentinel at will must not be able to
+// evict the evidence of an attack on a root-owned sentinel by generating
+// evidence of their own.
+func TestUserEvidenceNeverEvictsRootEvidence(t *testing.T) {
+	requireRoot(t) // needs a second owner for the user-owned sentinel
+	f := newFixture(t)
+	f.store.quotaBytes = 4000 // 2000 per pool
+	mustSnapshot(t, f)        // root-owned
+	writeFile(t, f.target, strings.Repeat("R", 1500), 0o640)
+	rootRes, err := f.store.Heal(f.target)
+	if err != nil || rootRes.Evidence == "" {
+		t.Fatalf("root heal: %+v %v", rootRes, err)
+	}
+
+	udir := filepath.Join(f.root, "home", "alice", ".ssh")
+	os.MkdirAll(udir, 0o700)
+	os.Chown(udir, 4242, 4242)
+	ukeys := filepath.Join(udir, "authorized_keys")
+	writeFile(t, ukeys, "alice\n", 0o600)
+	os.Chown(ukeys, 4242, 4242)
+	if err := f.store.Snapshot(ukeys); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		writeFile(t, ukeys, strings.Repeat("u", 900)+string(rune('a'+i)), 0o600)
+		os.Chown(ukeys, 4242, 4242)
+		if _, err := f.store.Heal(ukeys); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(rootRes.Evidence); err != nil {
+		t.Fatal("evidence of the root-owned sentinel was evicted by user-owned evidence")
+	}
+	var userBytes int64
+	ents, _ := os.ReadDir(f.quarantine)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), userPool) {
+			fi, _ := e.Info()
+			userBytes += fi.Size()
+		}
+	}
+	if userBytes > 2000 {
+		t.Errorf("user pool holds %d bytes, over its 2000-byte half of the quota", userBytes)
 	}
 }
