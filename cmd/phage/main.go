@@ -59,8 +59,8 @@ func cmdEvents(sock string, rest []string) {
 		return
 	}
 	for _, a := range resp.Alerts {
-		fmt.Printf("%s  score=%.2f  %-7s pid=%d comm=%q :: %q\n",
-			a.Time, a.Score, a.Action, a.PID, a.Comm, a.Reason)
+		fmt.Printf("%s  score=%.2f  requested=%s action=%s outcome=%q pid=%d comm=%q :: %q\n",
+			a.Time, a.Score, a.Requested, a.Action, a.Outcome, a.PID, a.Comm, a.Reason)
 	}
 }
 

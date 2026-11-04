@@ -51,8 +51,8 @@ type App struct {
 	fileExtract   feature.Filesystem
 	enableExtract feature.Enable
 	scorer        scorer.Scorer
-	freezer       *contain.Freezer
-	netq          *netquarantine.Manager
+	freezer       freezer
+	netq          isolator // nil unless isolate armed and loaded
 	healer        *selfheal.Store
 	audit         *audit.Writer
 
@@ -80,6 +80,19 @@ type App struct {
 	// when they last drew a high verdict (for escalation and auto-release).
 	contMu    sync.Mutex
 	contained map[int32]*contState
+}
+
+// freezer and isolator are the two containment actuators (cgroup freezer and
+// eBPF network quarantine), behind interfaces so the response path can be
+// tested without a kernel.
+type freezer interface {
+	Freeze(pid int32) error
+	Thaw(pid int32) error
+}
+
+type isolator interface {
+	Isolate(pid int32) error
+	Release(pid int32) error
 }
 
 type contState struct {
@@ -389,14 +402,9 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if parent == "" && len(ev.Lineage) > 0 {
 		parent = ev.Lineage[0].Comm
 	}
-	// The matrix says what the verdict would justify; the config says what the
-	// operator has allowed. Downgrade a rung that is not armed to an alert.
-	want, gateNote := a.gate(want)
+	requested := want // what the response matrix judged the verdict to justify
 
 	reason := reasons(v)
-	if gateNote != "" {
-		reason = fmt.Sprintf("%s [%s]", reason, gateNote)
-	}
 	// For egress anomalies, the concrete destination is the operator's first
 	// question; keep it in the reason and the audit trail even though the IP is
 	// deliberately not a learned feature.
@@ -412,48 +420,9 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if ev.Kind == kind.Enable && ev.EnableOp != "" {
 		reason = fmt.Sprintf("%s (op: %q)", reason, ev.EnableOp)
 	}
-	// Every attacker-influenced string (comm, parent, the reason — which embeds
-	// paths and executable names) is printed with %q, so a crafted name holding a
-	// newline or control bytes cannot forge an extra journal line.
-	log.Printf("%s score=%.2f action=%s pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=%q",
-		strings.ToUpper(labelFor(v.Score)), v.Score, want,
-		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
 
-	_ = a.audit.Record(audit.Entry{
-		Kind: audit.KindResponse, Action: string(want), Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
-	})
-
-	// Actuate the chosen rung.
-	contained := false
-	switch want {
-	case action.Isolate:
-		if ok, why := containmentSafe(ev, a.selfPID, a.proc, a.sshd); !ok {
-			log.Printf("CONTAIN pid=%d comm=%q ISOLATE SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
-			want = action.Notify
-		} else if a.netq != nil {
-			if err := a.netq.Isolate(ev.PID); err != nil {
-				log.Printf("ISOLATE pid=%d failed: %v", ev.PID, err)
-			} else {
-				contained = true
-				log.Printf("CONTAIN pid=%d comm=%q ISOLATED (egress severed, process alive, reversible)", ev.PID, ev.Comm)
-			}
-		} else if a.cfg.Armed(config.FeatureFreeze) { // isolation armed but failed to load — fall back to freeze
-			want = action.Freeze
-		} else {
-			want = action.Notify
-			log.Printf("ISOLATE pid=%d unavailable (network quarantine not loaded) and freeze not armed — alert only", ev.PID)
-		}
-	}
-	if want == action.Freeze && a.cfg.Armed(config.FeatureFreeze) {
-		if ok, why := containmentSafe(ev, a.selfPID, a.proc, a.sshd); !ok {
-			log.Printf("CONTAIN pid=%d comm=%q SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
-		} else if err := a.freezer.Freeze(ev.PID); err != nil {
-			log.Printf("CONTAIN pid=%d failed: %v", ev.PID, err)
-		} else {
-			contained = true
-			log.Printf("CONTAIN pid=%d comm=%q FROZEN (process tree quarantined, reversible)", ev.PID, ev.Comm)
-		}
-	}
+	applied, outcome := a.actuate(ev, requested)
+	contained := outcome == outcomeContained
 
 	// Self-heal a malicious write to a snapshotted sentinel file. Gated on the
 	// score crossing the containment threshold (the write is judged malicious),
@@ -466,14 +435,29 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		// writer already gone is not healed (the alert stands).
 		if ok, why := sameMountNS(a.proc, ev.PID); !ok {
 			log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
+			reason = fmt.Sprintf("%s [self-heal skipped: %s]", reason, why)
 		} else if a.healer.Claim(ev.File.Path) { // one pending heal per path, however many writes
 			go a.selfHeal(ev.File.Path)
 		}
 	}
 
+	// Logged and audited AFTER actuation, so the trail says what was asked
+	// for, what was done, and how it went. Every attacker-influenced string is
+	// printed with %q, so a crafted name holding a newline or control bytes
+	// cannot forge an extra journal line.
+	log.Printf("%s score=%.2f requested=%s action=%s outcome=%q pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=%q",
+		strings.ToUpper(labelFor(v.Score)), v.Score, requested, applied, outcome,
+		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
+	if err := a.audit.Record(audit.Entry{
+		Kind: audit.KindResponse, Requested: string(requested), Action: string(applied), Outcome: outcome,
+		Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
+	}); err != nil && err != audit.ErrDisabled {
+		log.Printf("audit: %v", err)
+	}
+
 	if contained {
 		a.contMu.Lock()
-		a.contained[ev.PID] = &contState{rung: want, last: time.Now(), comm: ev.Comm}
+		a.contained[ev.PID] = &contState{rung: applied, last: time.Now(), comm: ev.Comm}
 		a.contMu.Unlock()
 	}
 
@@ -484,12 +468,62 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	}
 	a.recent = append(a.recent, control.Alert{
 		Time: time.Now().UTC().Format(time.RFC3339), Score: v.Score,
-		Action: string(want), PID: ev.PID, Comm: ev.Comm, Reason: reason,
+		Requested: string(requested), Action: string(applied), Outcome: outcome,
+		PID: ev.PID, Comm: ev.Comm, Reason: reason,
 	})
 	if len(a.recent) > a.recentLimit {
 		a.recent = a.recent[len(a.recent)-a.recentLimit:]
 	}
 	a.mu.Unlock()
+}
+
+const (
+	outcomeContained = "contained"
+	outcomeNotified  = "notified"
+)
+
+// actuate carries out the matrix's choice as far as the config and the safety
+// gate allow, and reports the rung actually applied and how it went:
+// contained | notified | skipped:<why> | failed:<err>.
+func (a *App) actuate(ev model.Event, requested action.Type) (action.Type, string) {
+	want, gateNote := a.gate(requested)
+	if gateNote != "" {
+		return action.Notify, "skipped:" + gateNote
+	}
+	switch want {
+	case action.None:
+		return action.None, "none"
+	case action.Notify:
+		return action.Notify, outcomeNotified
+	}
+	if ok, why := containmentSafe(ev, a.selfPID, a.proc, a.sshd); !ok {
+		log.Printf("CONTAIN pid=%d comm=%q %s SKIPPED (%s) — alert only", ev.PID, ev.Comm, strings.ToUpper(string(want)), why)
+		return action.Notify, "skipped:" + why
+	}
+	if want == action.Isolate {
+		if a.netq != nil {
+			if err := a.netq.Isolate(ev.PID); err != nil {
+				log.Printf("ISOLATE pid=%d failed: %v", ev.PID, err)
+				return action.Notify, fmt.Sprintf("failed:isolate: %v", err)
+			}
+			log.Printf("CONTAIN pid=%d comm=%q ISOLATED (egress severed, process alive, reversible)", ev.PID, ev.Comm)
+			return action.Isolate, outcomeContained
+		}
+		if !a.cfg.Armed(config.FeatureFreeze) {
+			log.Printf("ISOLATE pid=%d unavailable (network quarantine not loaded) and freeze not armed — alert only", ev.PID)
+			return action.Notify, "skipped:network quarantine not loaded and freeze not armed"
+		}
+		want = action.Freeze // isolation armed but failed to load — fall back to freeze
+	}
+	if want == action.Freeze {
+		if err := a.freezer.Freeze(ev.PID); err != nil {
+			log.Printf("CONTAIN pid=%d failed: %v", ev.PID, err)
+			return action.Notify, fmt.Sprintf("failed:freeze: %v", err)
+		}
+		log.Printf("CONTAIN pid=%d comm=%q FROZEN (process tree quarantined, reversible)", ev.PID, ev.Comm)
+		return action.Freeze, outcomeContained
+	}
+	return action.Notify, fmt.Sprintf("skipped:%s not armable", want)
 }
 
 // announceStartup makes every start accountable. It logs one structured

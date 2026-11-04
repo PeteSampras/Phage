@@ -339,3 +339,88 @@ func TestRespondLogCannotBeLineForged(t *testing.T) {
 		t.Errorf("the newline in the path should appear escaped: %s", out)
 	}
 }
+
+type fakeFreezer struct{ frozen []int32 }
+
+func (f *fakeFreezer) Freeze(pid int32) error { f.frozen = append(f.frozen, pid); return nil }
+func (f *fakeFreezer) Thaw(int32) error       { return nil }
+
+type fakeIsolator struct {
+	isolated []int32
+	err      error
+}
+
+func (f *fakeIsolator) Isolate(pid int32) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.isolated = append(f.isolated, pid)
+	return nil
+}
+func (f *fakeIsolator) Release(int32) error { return nil }
+
+// The audit record is written after actuation and says what the matrix asked
+// for, what was applied and how it went — and `phage events` shows the same.
+func TestResponseRecordAfterActuation(t *testing.T) {
+	ordinary := model.Event{Kind: kind.Connect, PID: 900, PPID: 4321, Comm: "nc", ParentComm: "bash"}
+	cases := []struct {
+		name               string
+		enf                config.Enforcement
+		netq               *fakeIsolator
+		ev                 model.Event
+		requested          action.Type
+		wantAction         action.Type
+		wantOutcomePrefix  string
+		wantFroze, wantIso bool
+	}{
+		{"isolate armed and applied", config.Enforcement{Isolate: true}, &fakeIsolator{}, ordinary,
+			action.Isolate, action.Isolate, "contained", false, true},
+		{"isolate not armed", config.Enforcement{}, nil, ordinary,
+			action.Isolate, action.Notify, "skipped:isolate not armed", false, false},
+		{"isolate fails", config.Enforcement{Isolate: true}, &fakeIsolator{err: os.ErrPermission}, ordinary,
+			action.Isolate, action.Notify, "failed:isolate", false, false},
+		{"isolate unavailable, freeze armed: falls back", config.Enforcement{Isolate: true, Freeze: true}, nil, ordinary,
+			action.Isolate, action.Freeze, "contained", true, false},
+		{"isolate of verified sshd skipped", config.Enforcement{Isolate: true}, &fakeIsolator{},
+			model.Event{Kind: kind.Connect, PID: 700, PPID: 1, Comm: "sshd"},
+			action.Isolate, action.Notify, "skipped:control-plane", false, false},
+		{"freeze armed", config.Enforcement{Freeze: true}, nil, ordinary,
+			action.Freeze, action.Freeze, "contained", true, false},
+		{"notify", config.Enforcement{}, nil, ordinary,
+			action.Notify, action.Notify, "notified", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Mode, cfg.Enforcement = mode.Enforce, c.enf
+			a, path := appWithAudit(t, cfg, Meta{})
+			fz := &fakeFreezer{}
+			a.freezer, a.proc, a.sshd = fz, testProc, testSSHD()
+			a.contained, a.recentLimit = map[int32]*contState{}, 10
+			if c.netq != nil {
+				a.netq = c.netq
+			}
+			a.respond(c.ev, verdict.Verdict{Score: 0.95}, c.requested)
+
+			recs := readAudit(t, path)
+			if len(recs) != 1 {
+				t.Fatalf("records = %+v", recs)
+			}
+			r := recs[0]
+			if r.Requested != string(c.requested) || r.Action != string(c.wantAction) || !strings.HasPrefix(r.Outcome, c.wantOutcomePrefix) {
+				t.Errorf("record requested=%s action=%s outcome=%q; want %s/%s/%s*", r.Requested, r.Action, r.Outcome,
+					c.requested, c.wantAction, c.wantOutcomePrefix)
+			}
+			if (len(fz.frozen) > 0) != c.wantFroze {
+				t.Errorf("froze=%v, want %v", fz.frozen, c.wantFroze)
+			}
+			if c.netq != nil && (len(c.netq.isolated) > 0) != c.wantIso {
+				t.Errorf("isolated=%v, want %v", c.netq.isolated, c.wantIso)
+			}
+			got := a.RecentAlerts(1)[0]
+			if got.Requested != r.Requested || got.Action != r.Action || got.Outcome != r.Outcome || got.Reason != r.Reason {
+				t.Errorf("phage events disagrees with the audit trail: %+v vs %+v", got, r)
+			}
+		})
+	}
+}

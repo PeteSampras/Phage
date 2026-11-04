@@ -21,13 +21,16 @@ type Status struct {
 }
 
 // Alert is one surfaced verdict, as kept in the daemon's recent-alerts ring.
+// Requested/Action/Outcome match the audit trail's response record.
 type Alert struct {
-	Time   string  `json:"time"`
-	Score  float64 `json:"score"`
-	Action string  `json:"action"`
-	PID    int32   `json:"pid"`
-	Comm   string  `json:"comm"`
-	Reason string  `json:"reason"`
+	Time      string  `json:"time"`
+	Score     float64 `json:"score"`
+	Requested string  `json:"requested,omitempty"` // the rung the response matrix chose
+	Action    string  `json:"action"`              // the rung actually applied
+	Outcome   string  `json:"outcome,omitempty"`   // contained | notified | skipped:<why> | failed:<err>
+	PID       int32   `json:"pid"`
+	Comm      string  `json:"comm"`
+	Reason    string  `json:"reason"`
 }
 
 // Response is the daemon's reply.
