@@ -136,50 +136,100 @@ func TestGateDowngradesUnarmedRungs(t *testing.T) {
 	}
 }
 
-func TestAnnounceEnforcementWritesAuditRecord(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	aw, err := audit.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := config.Default()
-	c.Mode = mode.Enforce
-	a := &App{cfg: c, audit: aw}
-	a.announceEnforcement([]string{config.FeatureIsolate, config.FeatureSelfHeal}, []string{config.FeatureSelfProtect})
-	aw.Close()
-
+func readAudit(t *testing.T, path string) []audit.Entry {
+	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var e audit.Entry
-	if err := json.Unmarshal(raw, &e); err != nil {
-		t.Fatalf("audit line is not one JSON record: %v (%q)", err, raw)
+	var out []audit.Entry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e audit.Entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("audit line is not JSON: %v (%q)", err, line)
+		}
+		out = append(out, e)
 	}
-	if e.Kind != audit.KindEnforcementArmed || e.Mode != "enforce" {
-		t.Errorf("kind/mode = %q/%q, want enforcement_armed/enforce", e.Kind, e.Mode)
-	}
-	if strings.Join(e.Features, ",") != "isolate,self_heal" || strings.Join(e.Failed, ",") != "self_protect" {
-		t.Errorf("features=%v failed=%v", e.Features, e.Failed)
-	}
+	return out
 }
 
-func TestAnnounceEnforcementSilentInAuditWhenNothingArmed(t *testing.T) {
+func appWithAudit(t *testing.T, c config.Config, meta Meta) (*App, string) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	aw, err := audit.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &App{cfg: config.Default(), audit: aw}
-	a.announceEnforcement(nil, nil)
-	aw.Close()
-	if raw, _ := os.ReadFile(path); len(raw) != 0 {
-		t.Errorf("no feature armed, but an audit record was written: %q", raw)
+	t.Cleanup(func() { aw.Close() })
+	return &App{cfg: c, audit: aw, meta: meta, selfPID: selfPID}, path
+}
+
+func TestStartupRecordWhenArmed(t *testing.T) {
+	c := config.Default()
+	c.Mode = mode.Enforce
+	c.Source = config.Source{Path: "/etc/phage/phage.yaml", SHA256: strings.Repeat("ab", 32)}
+	a, path := appWithAudit(t, c, Meta{Version: "v-test"})
+	if err := a.announceStartup([]string{config.FeatureIsolate, config.FeatureSelfHeal}, []string{config.FeatureSelfProtect}); err != nil {
+		t.Fatal(err)
+	}
+	recs := readAudit(t, path)
+	if len(recs) != 2 || recs[0].Kind != audit.KindEnforcementArmed || recs[1].Kind != audit.KindStartup {
+		t.Fatalf("records = %+v, want enforcement_armed then startup", recs)
+	}
+	for _, e := range recs {
+		if e.Status != audit.StatusArmed || e.Mode != "enforce" || e.Version != "v-test" ||
+			e.ConfigPath != c.Source.Path || e.ConfigSHA256 != c.Source.SHA256 {
+			t.Errorf("record missing provenance/status: %+v", e)
+		}
+		if strings.Join(e.Features, ",") != "isolate,self_heal" || strings.Join(e.Failed, ",") != "self_protect" {
+			t.Errorf("features=%v failed=%v", e.Features, e.Failed)
+		}
 	}
 }
 
-// An attacker picks its own comm. Naming a payload "sshd" or "phaged" (or
-// parenting it under one) must not buy an exemption from containment.
+func TestStartupRecordOnEveryStart(t *testing.T) {
+	a, path := appWithAudit(t, config.Default(), Meta{Version: "v"})
+	if err := a.announceStartup(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	recs := readAudit(t, path)
+	if len(recs) != 1 || recs[0].Kind != audit.KindStartup || recs[0].Status != audit.StatusNone {
+		t.Fatalf("records = %+v, want one startup record with status none", recs)
+	}
+
+	c := config.Default()
+	c.Mode = mode.Enforce
+	a, path = appWithAudit(t, c, Meta{})
+	a.announceStartup(nil, []string{config.FeatureSelfProtect})
+	if recs := readAudit(t, path); len(recs) != 1 || recs[0].Status != audit.StatusFailed {
+		t.Fatalf("all requested features failed: records = %+v, want one startup record status failed (no ARMED record)", recs)
+	}
+}
+
+func TestStartupRecordsDowngrade(t *testing.T) {
+	c := config.Default()
+	c.Mode = mode.Alert
+	a, path := appWithAudit(t, c, Meta{Disarmed: []string{"freeze"}, DowngradedFrom: mode.Enforce})
+	if err := a.announceStartup(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	recs := readAudit(t, path)
+	if len(recs) != 2 || recs[0].Kind != audit.KindDisarmed || strings.Join(recs[0].Disarmed, ",") != "freeze" {
+		t.Fatalf("records = %+v, want a disarmed record first", recs)
+	}
+}
+
+func TestStartupRecordFailureIsFatal(t *testing.T) {
+	a, _ := appWithAudit(t, config.Default(), Meta{})
+	a.audit.Close() // writes now fail
+	if err := a.announceStartup([]string{config.FeatureFreeze}, nil); err == nil {
+		t.Fatal("a startup/arming record that cannot be written must be fatal")
+	}
+}
+
 func TestContainmentIgnoresSpoofedComm(t *testing.T) {
 	cases := []struct {
 		name string
@@ -197,16 +247,23 @@ func TestContainmentIgnoresSpoofedComm(t *testing.T) {
 	}
 }
 
-func TestSupervisorIsByPID(t *testing.T) {
-	a := &App{selfPID: selfPID, launcherPID: 1234}
-	if !a.isSupervisor(1) || !a.isSupervisor(1234) {
-		t.Error("pid 1 and the launcher must be trusted to stop the agent")
+func TestSupervisorIsPIDOneOnly(t *testing.T) {
+	a := &App{selfPID: selfPID, getppid: func() int { return 1234 }}
+	if !a.isSupervisor(1) {
+		t.Error("pid 1 must be trusted to stop the agent")
 	}
-	if a.isSupervisor(4321) {
-		t.Error("an arbitrary pid (whatever its comm) must not be trusted as the supervisor")
+	if a.isSupervisor(1234) || a.isSupervisor(4321) {
+		t.Error("without dev.trust_launcher_signals only pid 1 is the supervisor")
 	}
-	if b := (&App{launcherPID: 0}); b.isSupervisor(0) {
-		t.Error("an unknown launcher (0) must not make pid 0 trusted")
+	a.cfg.Dev.TrustLauncherSignals = true
+	if !a.isSupervisor(1234) {
+		t.Error("with dev.trust_launcher_signals the current parent is trusted")
+	}
+	// The parent is re-read at decision time: once the launcher has exited
+	// (reparented to 1), its old pid is no longer trusted.
+	a.getppid = func() int { return 1 }
+	if a.isSupervisor(1234) {
+		t.Error("a launcher that has gone away must not stay trusted")
 	}
 	if !a.isSelf(selfPID) || a.isSelf(fakePhagedPID) {
 		t.Error("isSelf must match the agent's tgid only")

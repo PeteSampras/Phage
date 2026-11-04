@@ -39,8 +39,9 @@ The first real value.
       `thaw <pid>` to release a false positive. Verified live against the attack.
 - [x] Race-free provenance: loginuid is now read in-kernel (eBPF), not from /proc.
 - [x] Threshold tuning via a YAML config file (`-config`), overlaid on defaults
-      and validated (notify ≤ contain, both in [0,1]); explicit flags override
-      the file. Unit-tested, including that the committed example always loads.
+      and validated (notify ≤ contain, both in [0,1]); path flags override the
+      file, `-mode` may only lower it, and no flag can enable a host-modifying
+      feature. Unit-tested, including that the committed example always loads.
 
 ## M2.5 — Exec sensor + containment safety
 - [x] Second eBPF sensor: `sched_process_exec` — catches the universal effect of
@@ -115,10 +116,10 @@ Techniques that defeat file-based tooling, caught behaviourally.
       active event stream going silent. Live-verified: a ptrace attach flagged
       CRITICAL while the agent kept running. See
       [demo](demo/agent-self-defense.md).
-- [x] **Tamper-resistance (enforcement):** `phaged -protect` loads a separate
+- [x] **Tamper-resistance (enforcement):** `enforcement.self_protect` (was `-protect`) loads a separate
       eBPF-LSM object (`selfprotect.bpf.o`, `lsm/task_kill`) that *denies* a
-      lethal/stop signal aimed at the agent from anyone but the launcher, pid 1,
-      or itself — so an attacker (even root) cannot kill it to blind it, while
+      lethal/stop signal aimed at the agent from anyone but pid 1 or itself
+      (the launcher only with `dev.trust_launcher_signals`) — so an attacker (even root) cannot kill it to blind it, while
       `systemctl stop`/reboot always work. Opt-in; inert without BPF LSM.
       Live-verified: a root `kill -9` on the agent was refused (EPERM), the agent
       survived, the launcher stopped it cleanly. See
@@ -175,7 +176,7 @@ Techniques that defeat file-based tooling, caught behaviourally.
       (and was detected), every subsequent dial was blocked, the process never
       stopped. See [demo](demo/network-quarantine.md).
 - [ ] Also cut established sockets (`cgroup_skb/egress`); TTL auto-release.
-- [x] **Self-heal:** `phaged -heal` snapshots sentinel files (authorized_keys,
+- [x] **Self-heal:** `enforcement.self_heal` (was `-heal`) snapshots sentinel files (authorized_keys,
       cron, ld.so.preload) and, on a malicious-write verdict (enforce), atomically
       restores the known-good version while quarantining the attacker's as
       evidence. Verdict- and snapshot-gated, so a legitimate edit is never

@@ -262,24 +262,35 @@ phage thaw <pid>            # manually release a contained process
    freeze your SSH session or the control plane.
 
 **In this fork nothing acts by default, even in enforce mode.** Every acting
-feature — `isolate` (network quarantine), `freeze`, `self_heal`, `self_protect`
-(eBPF-LSM tamper-resistance) and `honeytokens` — is off until its own key is set,
-and is honoured only with `mode: enforce`; phaged refuses to start if one is set
-in learn or alert mode. When any arms, phaged logs one `ENFORCEMENT ARMED` line
-and writes an `enforcement_armed` audit record. See [FORK.md](FORK.md).
+feature — `isolate` (network quarantine), `freeze`, `self_heal` and
+`self_protect` (eBPF-LSM tamper-resistance) — is off until its own key is set to
+the literal `true` in the config file, and is honoured only with
+`mode: enforce`; phaged refuses to start if one is set in learn or alert mode.
+Decoys (`deception.honeytokens`) are a separate opt-in allowed in alert and
+enforce. Every start writes a `startup` audit record (mode, what armed, the
+config file's path and sha256, version); when anything arms phaged also logs one
+`ENFORCEMENT ARMED` line and writes an `enforcement_armed` record. See
+[FORK.md](FORK.md).
 
 ```yaml
 mode: enforce
+audit_path: /var/lib/phage/audit.jsonl   # required for any of the below
 enforcement:
   isolate: true        # sever egress of a process on a high egress/C2 verdict
   freeze: false
   self_heal: true
   self_protect: false
+deception:
   honeytokens: true
 ```
 
-The old `-honeytokens -heal -protect` flags still exist as overrides for the
-matching keys, under the same rule: they are refused unless the mode is enforce.
+**No command-line flag can enable any of these.** The old `-heal`, `-protect`
+and `-honeytokens` flags are now errors naming the config key that replaced
+them. `-mode` may only *lower* the config file's mode: in an emergency,
+`phaged -config /etc/phage/phage.yaml -mode alert` starts with every
+enforcement feature disarmed, logs `ENFORCEMENT DISARMED` and writes a
+`disarmed` audit record, instead of refusing to start. `-mode enforce` without
+`-config` is refused.
 
 To remove everything: `sudo make uninstall` from the clone — it keeps your config
 and baseline unless you also delete `/etc/phage` and `/var/lib/phage`.

@@ -21,19 +21,31 @@ thresholds:
   notify: 0.4   # at/above this score, raise an alert
   contain: 0.8  # at/above this score, contain (enforce mode + an armed enforcement feature only)
 
+# Append-only JSON-lines audit trail (created 0600, never through a symlink).
+# On by default; REQUIRED whenever any enforcement or deception feature is on.
+# Every start writes a `startup` record (mode, what armed, this file's path and
+# sha256, version) — alert on `status` != none.
+audit_path: /var/lib/phage/audit.jsonl
+
 # Seconds an ISOLATED process must stay quiet before it is automatically
-# released (graduated de-escalation). Frozen processes are never auto-released.
+# released (graduated de-escalation; at least 1). Frozen processes are never
+# auto-released.
 release_after: 300
 
 # Acting features. EVERY ONE IS OFF BY DEFAULT and each arms only when
-# `mode: enforce` AND its own key below is true. phaged refuses to start if any
-# of them is true in learn or alert mode (fail closed). Without this block,
-# enforce mode scores and alerts exactly like alert mode — nothing acts.
-# When any feature arms, phaged logs one "ENFORCEMENT ARMED" line and writes an
-# `enforcement_armed` audit record so a SIEM can alert on it.
+# `mode: enforce` AND its own key below is the literal `true` (yes/on/1 are
+# rejected). phaged refuses to start if any of them is true in learn or alert
+# mode. They can be enabled ONLY here — no command-line flag can arm them, and
+# `-mode` may only lower this file's mode (an emergency `-mode alert` starts
+# with them all disarmed and records that). Without this block, enforce mode
+# scores and alerts exactly like alert mode — nothing acts.
 enforcement:
   isolate: false       # network quarantine: sever egress of a process on a high egress/C2 verdict
   freeze: false        # cgroup-freeze a process tree on a high-confidence verdict (held for `phage thaw`)
   self_heal: false     # restore authorized_keys/cron/ld.so.preload after a malicious write
   self_protect: false  # eBPF-LSM: deny signals that would kill the agent (needs BPF LSM)
+
+# Deception. Creates decoy files on the host (so it is opt-in and announced in
+# the startup record) but acts on no process: allowed in alert and enforce.
+deception:
   honeytokens: false   # plant decoy credential files; a read of one is a high-confidence alert

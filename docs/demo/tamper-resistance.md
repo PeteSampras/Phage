@@ -6,14 +6,16 @@ it. This is the enforcement half of self-defense: detection says "someone is
 attacking me"; this says "and they can't."
 
 ## How it works
-With `mode: enforce` and `enforcement.self_protect: true` (or `-protect`, which is refused outside enforce), the agent loads a small eBPF-LSM object
+With `mode: enforce` and `enforcement.self_protect: true` in the config file (the old `-protect` flag is now an error), the agent loads a small eBPF-LSM object
 (`selfprotect.bpf.o`) that hooks `lsm/task_kill` and **denies** a lethal/stop
 signal (`SIGKILL`/`SIGTERM`/`SIGSTOP`/`SIGINT`/`SIGQUIT`) aimed at the agent —
 returning `EPERM` from inside the kernel, below even root's `kill`.
 
 ### Safety (this project has a lockout scar — so this is deliberate)
-The denial is inert unless self-protection is armed, and it **always allows** three
-senders: the agent itself, its launcher (parent pid), and **pid 1 (systemd/init)**.
+The denial is inert unless self-protection is armed, and it **always allows** two
+senders: the agent itself and **pid 1 (systemd/init)**. (This fork: the launcher
+is allowed too only with the development setting `dev.trust_launcher_signals:
+true`.)
 So `systemctl stop` (sent by pid 1) and a reboot always stop the agent — it can
 never truly lock the box out. Detaching the program (the agent exiting) lifts all
 protection. The LSM object is separate from the detection sensors, so a kernel

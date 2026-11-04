@@ -57,12 +57,15 @@ type App struct {
 	healer        *selfheal.Store
 	audit         *audit.Writer
 
+	meta Meta
+
 	// Identity used to trust events — never the attacker-chosen comm. selfPID is
-	// the agent's own tgid; launcherPID is the parent that started it (pid 1
-	// under systemd). exeOf resolves /proc/<pid>/exe (swappable in tests).
-	selfPID     int32
-	launcherPID int32
-	exeOf       func(pid int32) string
+	// the agent's own tgid; getppid returns its current parent (consulted only
+	// when dev.trust_launcher_signals is on). exeOf resolves /proc/<pid>/exe
+	// (swappable in tests).
+	selfPID int32
+	getppid func() int
+	exeOf   func(pid int32) string
 
 	started time.Time
 	// counters and the recent-alerts ring back the control interface.
@@ -85,9 +88,17 @@ type contState struct {
 	comm string
 }
 
-// New builds an App from config, the path to the compiled eBPF object, and the
-// repository used to persist the learned baseline.
-func New(cfg config.Config, objPath string, store profile.Repository) *App {
+// Meta is what the entrypoint knows about this run beyond the config: the
+// build version and any features a -mode downgrade switched off.
+type Meta struct {
+	Version        string
+	Disarmed       []string  // host-modifying features switched off by a -mode downgrade
+	DowngradedFrom mode.Mode // the config file's mode, when Disarmed is non-empty
+}
+
+// New builds an App from config, the path to the compiled eBPF object, the
+// repository used to persist the learned baseline, and run metadata.
+func New(cfg config.Config, objPath string, store profile.Repository, meta Meta) *App {
 	p := baseline.NewProfile()
 	return &App{
 		cfg:         cfg,
@@ -100,8 +111,9 @@ func New(cfg config.Config, objPath string, store profile.Repository) *App {
 		started:     time.Now(),
 		recentLimit: 100,
 		contained:   map[int32]*contState{},
+		meta:        meta,
 		selfPID:     int32(os.Getpid()),
-		launcherPID: int32(os.Getppid()),
+		getppid:     os.Getppid,
 		exeOf:       process.Exe,
 	}
 }
@@ -176,14 +188,21 @@ func (a *App) Run(ctx context.Context) error {
 			failed = append(failed, config.FeatureSelfProtect)
 		} else {
 			objPath := filepath.Join(filepath.Dir(a.objPath), "selfprotect.bpf.o")
-			g, err := selfprotect.Arm(objPath, uint32(os.Getpid()), uint32(os.Getppid()))
+			// The LSM always allows pid 1 and the agent itself; the launcher slot
+			// gets a real pid only when dev.trust_launcher_signals says so (pid 1
+			// otherwise, which adds nothing).
+			launcher := uint32(1)
+			if a.cfg.Dev.TrustLauncherSignals {
+				launcher = uint32(os.Getppid())
+			}
+			g, err := selfprotect.Arm(objPath, uint32(os.Getpid()), launcher)
 			if err != nil {
 				log.Printf("self-protection: %v; running without it", err)
 				failed = append(failed, config.FeatureSelfProtect)
 			} else {
 				defer g.Close()
 				armed = append(armed, config.FeatureSelfProtect)
-				log.Printf("self-protection ARMED: signals that would kill the agent are denied (except from pid 1 / launcher); systemctl stop and reboot still work")
+				log.Printf("self-protection ARMED: signals that would kill the agent are denied (except from pid 1); systemctl stop and reboot still work")
 			}
 		}
 	}
@@ -222,7 +241,9 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	a.announceEnforcement(armed, failed)
+	if err := a.announceStartup(armed, failed); err != nil {
+		return err // fatal: an armed host we cannot account for must not run
+	}
 
 	log.Printf("sensors attached (creds, exec, egress, files, kernel-enabling ops, self-defense); mode=%s obj=%s", a.cfg.Mode, a.objPath)
 
@@ -382,7 +403,7 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		strings.ToUpper(labelFor(v.Score)), v.Score, want,
 		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
 
-	a.audit.Record(audit.Entry{
+	_ = a.audit.Record(audit.Entry{
 		Kind: audit.KindResponse, Action: string(want), Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
 	})
 
@@ -444,31 +465,72 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	a.mu.Unlock()
 }
 
-// announceEnforcement makes arming loud: one structured log line naming every
-// acting feature armed in this run (and any requested feature that failed to
-// arm), mirrored as an enforcement_armed audit record a SIEM can alert on. When
-// nothing armed it says so once, so "alert only" is explicit in the journal too.
-func (a *App) announceEnforcement(armed, failed []string) {
-	if len(armed) == 0 && len(failed) == 0 {
-		if a.cfg.Mode == mode.Enforce {
-			log.Printf("enforcement: mode=enforce but no enforcement feature is enabled in the config: verdicts alert only")
-		} else {
-			log.Printf("enforcement: none armed (mode=%s): detection and alerting only", a.cfg.Mode)
-		}
-		return
+// announceStartup makes every start accountable. It logs one structured
+// startup line and writes a `startup` audit record on every start (mode, what
+// armed, config path + sha256, version); when anything host-modifying armed it
+// also logs the ENFORCEMENT ARMED line and writes an `enforcement_armed`
+// record, and when a -mode downgrade switched features off it logs that and
+// writes a `disarmed` record. Failing to write any of these is fatal.
+func (a *App) announceStartup(armed, failed []string) error {
+	status := audit.StatusNone
+	switch {
+	case len(armed) > 0:
+		status = audit.StatusArmed
+	case len(failed) > 0:
+		status = audit.StatusFailed
 	}
-	log.Printf("ENFORCEMENT ARMED event=enforcement_armed mode=%s features=%s failed=%s pid=%d",
-		a.cfg.Mode, joinOrNone(armed), joinOrNone(failed), os.Getpid())
-	a.audit.Record(audit.Entry{
-		Kind:     audit.KindEnforcementArmed,
-		Action:   audit.KindEnforcementArmed,
-		PID:      int32(os.Getpid()),
-		Comm:     "phaged",
-		Mode:     a.cfg.Mode.String(),
-		Features: armed,
-		Failed:   failed,
-		Reason:   fmt.Sprintf("acting features armed: %s; requested but not armed: %s", joinOrNone(armed), joinOrNone(failed)),
-	})
+	src := a.cfg.Source
+	base := audit.Entry{
+		PID: a.selfPID, Comm: "phaged", Mode: a.cfg.Mode.String(), Version: a.meta.Version,
+		ConfigPath: src.Path, ConfigSHA256: src.SHA256,
+	}
+	prov := fmt.Sprintf("config_path=%q config_sha256=%s version=%q pid=%d",
+		src.Path, orNone(src.SHA256), a.meta.Version, a.selfPID)
+
+	var records []audit.Entry
+	if len(a.meta.Disarmed) > 0 {
+		log.Printf("ENFORCEMENT DISARMED event=disarmed from_mode=%s mode=%s disarmed=%s %s — -mode downgrade overrides the config file for this run",
+			a.meta.DowngradedFrom, a.cfg.Mode, joinOrNone(a.meta.Disarmed), prov)
+		e := base
+		e.Kind, e.Action, e.Disarmed = audit.KindDisarmed, audit.KindDisarmed, a.meta.Disarmed
+		e.Reason = fmt.Sprintf("-mode %s over a %s config switched off: %s", a.cfg.Mode, a.meta.DowngradedFrom, joinOrNone(a.meta.Disarmed))
+		records = append(records, e)
+	}
+	if status == audit.StatusArmed {
+		log.Printf("ENFORCEMENT ARMED event=enforcement_armed status=%s mode=%s features=%s failed=%s %s",
+			status, a.cfg.Mode, joinOrNone(armed), joinOrNone(failed), prov)
+		e := base
+		e.Kind, e.Action, e.Status, e.Features, e.Failed = audit.KindEnforcementArmed, audit.KindEnforcementArmed, status, armed, failed
+		e.Reason = fmt.Sprintf("host-modifying features armed: %s; requested but not armed: %s", joinOrNone(armed), joinOrNone(failed))
+		records = append(records, e)
+	}
+	log.Printf("startup event=startup status=%s mode=%s features=%s failed=%s %s",
+		status, a.cfg.Mode, joinOrNone(armed), joinOrNone(failed), prov)
+	e := base
+	e.Kind, e.Action, e.Status, e.Features, e.Failed, e.Disarmed = audit.KindStartup, audit.KindStartup, status, armed, failed, a.meta.Disarmed
+	e.Reason = fmt.Sprintf("phaged started: mode=%s status=%s", a.cfg.Mode, status)
+	records = append(records, e)
+
+	if a.audit == nil {
+		log.Printf("audit trail disabled (audit_path empty): startup not recorded")
+		return nil
+	}
+	for _, r := range records {
+		if err := a.audit.Record(r); err != nil {
+			return fmt.Errorf("write %s audit record: %w", r.Kind, err)
+		}
+	}
+	if err := a.audit.Sync(); err != nil {
+		return fmt.Errorf("sync audit trail: %w", err)
+	}
+	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 func joinOrNone(s []string) string {
@@ -542,11 +604,20 @@ func (a *App) isSelf(pid int32) bool { return pid == a.selfPID }
 
 // isSupervisor reports whether pid may legitimately send the agent a stop
 // signal: pid 1 (systemd/init, which is what `systemctl stop` and shutdown
-// signal from) or the process that launched the agent. A lethal signal from
-// anything else is a tamper attempt — whatever it calls itself; upstream
-// trusted the comm names "systemd"/"init", which any process can adopt.
+// signal from). A lethal signal from anything else is a tamper attempt —
+// whatever it calls itself; upstream trusted the comm names "systemd"/"init",
+// which any process can adopt. For hand runs, dev.trust_launcher_signals also
+// trusts the agent's CURRENT parent, re-read at decision time so a launcher
+// that has exited (and whose pid may be reused) is never trusted.
 func (a *App) isSupervisor(pid int32) bool {
-	return pid == 1 || (a.launcherPID > 1 && pid == a.launcherPID)
+	if pid == 1 {
+		return true
+	}
+	if !a.cfg.Dev.TrustLauncherSignals || a.getppid == nil {
+		return false
+	}
+	ppid := int32(a.getppid())
+	return ppid > 1 && pid == ppid
 }
 
 // respondSelfDefense handles an attack on the agent itself. It is deliberately

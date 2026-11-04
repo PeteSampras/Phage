@@ -5,14 +5,14 @@ instant they reach for credentials — with a decoy wired directly into the kern
 `open` path, not a cloud callback an attacker could block.
 
 ## How it works
-With `mode: enforce` and `enforcement.honeytokens: true` (or `-honeytokens`, which is refused outside enforce — planting files is an action on the host), the agent plants a few decoy credential files in the
+With `deception.honeytokens: true` in the config file and `mode: alert` or `enforce` (the old `-honeytokens` flag is now an error; planting files is a host change, so it is opt-in and announced in the startup audit record), the agent plants a few decoy credential files in the
 places an intruder greps for secrets — a fake `~/.aws/credentials`, a fake SSH
 key, a fake `.pgpass` — each with obviously-inert content, and **only where no
 real file already exists** (a honeytoken never clobbers a real credential). It
 registers their inode numbers with the kernel sensor; any **open** of one — read
 or write — is reported. Nothing legitimate references these files, so a read is a
 near-zero-false-positive sign of snooping. It is scored directly (not through the
-learned baseline), so it fires on an empty baseline. *(This fork: decoys are planted only in enforce mode; the alert run below predates that.)*
+learned baseline), so it fires on an empty baseline.
 
 ## The run (alert mode)
 ```

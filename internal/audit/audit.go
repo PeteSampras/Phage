@@ -5,66 +5,124 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// Event kinds an Entry can carry, so a SIEM can route on them.
+// Record kinds, so a SIEM can route on them.
 const (
-	KindResponse         = "response"          // a verdict and the action taken on it
-	KindEnforcementArmed = "enforcement_armed" // startup: acting features armed in this run
+	KindResponse         = "response"          // a verdict, what the matrix asked for, and what was done
+	KindStartup          = "startup"           // every start: mode, what armed, config provenance
+	KindEnforcementArmed = "enforcement_armed" // startup, when any host-modifying feature was requested
+	KindDisarmed         = "disarmed"          // startup, when a -mode downgrade switched features off
 )
 
-// Entry is one recorded action.
+// Startup status values.
+const (
+	StatusArmed  = "armed"  // at least one requested host-modifying feature armed
+	StatusFailed = "failed" // features were requested but none armed
+	StatusNone   = "none"   // nothing host-modifying was requested
+)
+
+// Entry is one recorded event. Response records use Requested/Action/Outcome;
+// startup records use the provenance and feature fields.
 type Entry struct {
-	Time     time.Time `json:"time"`
-	Kind     string    `json:"kind,omitempty"`
-	Action   string    `json:"action"`
-	Score    float64   `json:"score"`
-	PID      int32     `json:"pid"`
-	Comm     string    `json:"comm"`
-	Reason   string    `json:"reason"`
-	Mode     string    `json:"mode,omitempty"`
-	Features []string  `json:"features,omitempty"` // enforcement_armed: features that armed
-	Failed   []string  `json:"failed,omitempty"`   // enforcement_armed: features requested but not armed
+	Time      time.Time `json:"time"`
+	Kind      string    `json:"kind,omitempty"`
+	Requested string    `json:"requested,omitempty"` // the rung the response matrix chose
+	Action    string    `json:"action"`              // the rung actually applied
+	Outcome   string    `json:"outcome,omitempty"`   // contained | notified | skipped:<why> | failed:<err>
+	Score     float64   `json:"score"`
+	PID       int32     `json:"pid"`
+	Comm      string    `json:"comm"`
+	Reason    string    `json:"reason"`
+
+	Status       string   `json:"status,omitempty"`
+	Mode         string   `json:"mode,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	ConfigPath   string   `json:"config_path,omitempty"`
+	ConfigSHA256 string   `json:"config_sha256,omitempty"`
+	Features     []string `json:"features,omitempty"` // host-modifying features that armed
+	Failed       []string `json:"failed,omitempty"`   // requested but not armed
+	Disarmed     []string `json:"disarmed,omitempty"` // switched off by a -mode downgrade
 }
 
 // Writer appends entries to a file. A nil *Writer is valid and discards writes,
-// so auditing can be left disabled without nil checks at the call site.
+// so auditing can be left disabled (learn/alert without host-modifying
+// features) without nil checks at the call site.
 type Writer struct {
 	mu sync.Mutex
 	f  *os.File
 }
 
-// Open returns a Writer appending to path. An empty path disables auditing
-// (returns a nil *Writer, which is safe to use).
+// Open returns a Writer appending to path, created 0600. The final component
+// is opened O_NOFOLLOW so a planted symlink cannot redirect root's appends, and
+// a pre-existing file with looser permissions is tightened. An empty path
+// disables auditing (nil *Writer).
 func Open(path string) (*Writer, error) {
 	if path == "" {
 		return nil, nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("audit trail directory: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
+		return nil, fmt.Errorf("open audit trail %q: %w", path, err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
 		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("audit trail %q is not a regular file", path)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := f.Chmod(0o600); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("tighten audit trail %q to 0600: %w", path, err)
+		}
 	}
 	return &Writer{f: f}, nil
 }
 
-// Record appends one entry. Time is set if the caller left it zero.
-func (w *Writer) Record(e Entry) {
+// ErrDisabled is returned by Record on a nil Writer.
+var ErrDisabled = errors.New("audit trail disabled")
+
+// Record appends one entry. Time is set if the caller left it zero. Callers
+// for whom the record is mandatory (startup / arming) treat an error as fatal.
+func (w *Writer) Record(e Entry) error {
 	if w == nil || w.f == nil {
-		return
+		return ErrDisabled
 	}
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
 	b, err := json.Marshal(e)
 	if err != nil {
-		return
+		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.f.Write(append(b, '\n'))
+	if _, err := w.f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Sync flushes the trail to disk.
+func (w *Writer) Sync() error {
+	if w == nil || w.f == nil {
+		return ErrDisabled
+	}
+	return w.f.Sync()
 }
 
 // Close closes the underlying file.

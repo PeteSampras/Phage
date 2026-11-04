@@ -32,10 +32,10 @@ sudo cp configs/phage.example.yaml /etc/phage/phage.yaml
 # mode: learn   (do not change yet)
 sudo phaged -config /etc/phage/phage.yaml
 ```
-Any flag overrides the file for that run — e.g. `sudo phaged -config
-/etc/phage/phage.yaml -mode alert` to try alert mode without editing the file.
-Acting features are the exception in spirit: they belong in the config file's
-`enforcement:` block and are refused outside `mode: enforce`.
+Path flags (`-state`, `-audit`, `-control`) override the file for that run.
+`-mode` may only **lower** the file's mode (e.g. `-mode learn` over an alert
+config); it can never raise it, and `-mode enforce` without `-config` is
+refused. Host-modifying features can be enabled only in the config file.
 Let it learn for at least a week (`learn_window`). It is building the baseline of
 how your server normally behaves. It will not alert or act in this phase — that
 is correct.
@@ -58,7 +58,9 @@ enforcement:
   isolate: true    # network quarantine for egress/C2 verdicts
   freeze: true     # reversible cgroup freeze; release with `phage thaw <pid>`
 ```
-Setting an `enforcement:` key (or `-heal`/`-protect`/`-honeytokens`) in learn or
-alert mode is a startup error. Nothing is ever killed.
+Setting an `enforcement:` key in learn or alert mode is a startup error, and the
+old `-heal`/`-protect`/`-honeytokens` flags are errors in every mode. Check
+`/var/lib/phage/audit.jsonl`: each start writes a `startup` record saying what
+armed. Nothing is ever killed.
 
 See [modes](../concepts/modes.md) for why this ordering matters.

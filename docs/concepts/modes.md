@@ -33,11 +33,18 @@ only climbs when the operator is ready.
   them on, enforce behaves exactly like alert. A containment rung the matrix
   picks but the config has not armed is downgraded to an alert (and the audit
   reason says so). Kill is never used.
-- Each feature arms only with `mode: enforce` **and** its own key true. A key (or
-  the matching `-heal`/`-protect`/`-honeytokens` flag) set in learn or alert mode
-  is a **startup error** — phaged fails closed rather than guessing.
-- Anything that arms is announced: one `ENFORCEMENT ARMED features=...` log line
-  and an `enforcement_armed` audit record, so a SIEM can alert on it.
+- Each feature arms only with `mode: enforce` **and** its own key set to the
+  literal `true` in the config file. A key set in learn or alert mode is a
+  **startup error** — phaged fails closed rather than guessing. No command-line
+  flag can enable one (`-heal`/`-protect`/`-honeytokens` are now errors), and
+  `-mode` may only lower the file's mode: an emergency `-mode alert` starts
+  disarmed and records a `disarmed` audit event.
+- `deception.honeytokens` (decoy files) is a separate opt-in, allowed in alert
+  and enforce, announced like the others.
+- Every start writes a `startup` audit record (`status=armed|failed|none`, the
+  config path and sha256); anything that arms is also announced with one
+  `ENFORCEMENT ARMED ...` log line and an `enforcement_armed` record, so a SIEM
+  can alert on it. Host-modifying features require `audit_path`.
 
 ## Containment safety — what enforce will NEVER freeze
 Learned the hard way: an early enforce build froze the shell of an incoming SSH

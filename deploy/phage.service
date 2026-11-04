@@ -8,10 +8,11 @@ Wants=network-online.target
 Type=simple
 # Starts in whatever mode /etc/phage/phage.yaml sets — which ships as `learn`.
 # NEVER change that to enforce on a fresh install; climb learn -> alert -> enforce.
-# Acting features (isolate, freeze, self_heal, self_protect, honeytokens) are
-# turned on ONLY in the `enforcement:` block of /etc/phage/phage.yaml, and only
-# take effect with `mode: enforce`; phaged refuses to start if one is enabled in
-# learn or alert mode. Do not add -heal/-protect/-honeytokens here.
+# Acting features (isolate, freeze, self_heal, self_protect) are turned on ONLY
+# in the `enforcement:` block of /etc/phage/phage.yaml and only take effect with
+# `mode: enforce`; decoys only via `deception.honeytokens`. No flag can enable
+# them (-heal/-protect/-honeytokens are errors). For an emergency downgrade add
+# `-mode alert` here: phaged starts disarmed and records it in the audit trail.
 ExecStart=/usr/local/bin/phaged -config /etc/phage/phage.yaml -bpf /usr/local/lib/phage/sensors.bpf.o
 
 Restart=on-failure

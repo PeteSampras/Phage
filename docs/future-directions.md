@@ -63,8 +63,8 @@ explainable loop* is the new part).
 - Never-lock-out guardrail, chaos-tested (consensus #2).
 
 ### Tier 3 — Autonomy depth + the "immune-system reel" (M)
-- **Honeytokens fused into the kernel sensor** — ✅ **shipped** (`phaged
-  -honeytokens`, [demo](demo/honeytokens.md)): decoys planted only where no real
+- **Honeytokens fused into the kernel sensor** — ✅ **shipped** (`deception.honeytokens`, was
+  `-honeytokens`; [demo](demo/honeytokens.md)): decoys planted only where no real
   file exists, inodes registered in-kernel, any read → CRITICAL, removed on exit.
   Highest-signal detector; near-zero FP.
 - **Per-process net-quarantine** — ✅ **shipped** ([demo](demo/network-quarantine.md)):
@@ -72,7 +72,7 @@ explainable loop* is the new part).
   `cgroup/connect` programs attached to its cgroup (catches forked children),
   process stays alive, reversible via `phage thaw`. Follow-up: `cgroup_skb/egress`
   to also cut established sockets; a TTL auto-release.
-- **Self-healing restore** — ✅ **shipped** (`phaged -heal`,
+- **Self-healing restore** — ✅ **shipped** (`enforcement.self_heal`, was `-heal`;
   [demo](demo/self-healing.md)): snapshots sentinel files and, on a malicious-write
   verdict, atomically restores the known-good version and quarantines the
   attacker's. Verdict- and snapshot-gated so legit edits aren't reverted.
