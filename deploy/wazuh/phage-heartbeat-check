@@ -10,6 +10,8 @@
 #   status=fresh age=<s> max=<s>      the last heartbeat is recent enough
 #   status=stale age=<s> max=<s>      no heartbeat for longer than max seconds
 #   status=missing reason=<why> ...   no audit trail, or no heartbeat in it
+#   status=skew age=<s> max=<s>       the last heartbeat is more than max seconds
+#                                     in the future (a clock jump); not trustworthy
 #
 # usage: phage-heartbeat-check [max_age_seconds] [audit_trail]
 #   max_age_seconds  default 180 (three default 60 s heartbeat intervals)
@@ -17,6 +19,8 @@
 #
 # Read-only. Needs GNU date and tac, and read access to the trail (0600 root;
 # the Wazuh agent's logcollector runs as root).
+PATH=/usr/bin:/bin
+export PATH
 max=${1:-180}
 trail=${2:-/var/lib/phage/audit.jsonl}
 
@@ -43,7 +47,9 @@ if ! then=$(date -d "$last" +%s 2>/dev/null); then
 	exit 0
 fi
 age=$(($(date +%s) - then))
-if [ "$age" -gt "$max" ]; then
+if [ "$age" -lt "-$max" ]; then
+	echo "status=skew age=$age max=$max"
+elif [ "$age" -gt "$max" ]; then
 	echo "status=stale age=$age max=$max"
 else
 	echo "status=fresh age=$age max=$max"

@@ -9,11 +9,19 @@
     /var/lib/phage/novelty.jsonl  novelty_finding rows (advisory, source_kind heuristic)
   plus two agent-side command checks: the heartbeat's age and phage.service's state.
 
-  `status` and `action` are Wazuh static field names: the JSON decoder may
-  store those keys as static fields, which <field name=...> does not see. So
-  no rule here matches them. A startup record's status is read from its
-  reason ("... status=armed"), and a novelty row is a finding when it has a
-  score and unlearned when its message ends "(unlearned)".
+  `status` and `action` are Wazuh static field names. Whether the JSON
+  decoder stores those keys as static fields (matched by <status>/<action>)
+  or as dynamic ones (matched by <field name=...>) has not been checked on a
+  manager, so no rule here depends on either: a startup record's status is
+  read from its reason ("... status=armed"), and a novelty row is a finding
+  when it has a score, unlearned when its message ends "(unlearned)" and a
+  burst when it ends "(burst)". phaged's tests pin those formats. Once
+  wazuh-logtest shows how your manager stores `status`, matching it directly
+  is equivalent (docs/wazuh.md).
+
+  The parent rules are pinned to the two files by <location>, so another
+  JSON log with similar keys cannot trip them. If you move the files
+  (audit_path, output.novelty_path), change the locations here too.
 -->
 <group name="phage,">
 
@@ -21,6 +29,7 @@
 
   <rule id="100800" level="0">
     <decoded_as>json</decoded_as>
+    <location>/var/lib/phage/audit.jsonl</location>
     <field name="kind" type="pcre2">^(startup|enforcement_armed|disarmed|response|self_heal|heartbeat)$</field>
     <field name="pid" type="pcre2">^-?\d+$</field>
     <field name="reason" type="pcre2">\S</field>
@@ -52,7 +61,10 @@
     <group>phage_startup,</group>
   </rule>
 
-  <!-- A start loop: three starts within ten minutes (Restart=on-failure). -->
+  <!-- A start loop: three startup records within ten minutes. This sees
+       only starts that got as far as writing their record; a start that
+       fails before it (a broken config, a full /var) writes nothing, and
+       is caught by 100841 (service not active) and 100840 (no heartbeat). -->
   <rule id="100804" level="12" frequency="3" timeframe="600">
     <if_matched_group>phage_startup</if_matched_group>
     <same_location />
@@ -91,6 +103,8 @@
     <description>Phage: response FAILED for $(comm) pid $(pid): $(outcome).</description>
   </rule>
 
+  <!-- 0.8 is the default thresholds.contain; rules cannot read the config,
+       so change the pattern if you change it. -->
   <rule id="100813" level="11">
     <if_sid>100810</if_sid>
     <field name="score" type="pcre2">^(0\.[89]\d*|1(\.0+)?)$</field>
@@ -150,6 +164,24 @@
     <description>Phage: baseline checkpoints have failed ($(health.checkpoint_errors) since start).</description>
   </rule>
 
+  <!-- Sensors attached but nothing arriving: three consecutive heartbeats
+       reporting zero events (a blinded or detached sensor; a busy server is
+       never at zero). The timeframe covers three default 60 s intervals;
+       scale it with output.heartbeat_interval. Last child of 100820, so a
+       heartbeat that also reports drops or errors fires that rule instead. -->
+  <rule id="100825" level="0">
+    <if_sid>100820</if_sid>
+    <field name="health.events" type="pcre2">^0$</field>
+    <description>Phage: heartbeat with no events.</description>
+    <group>phage_idle,</group>
+  </rule>
+
+  <rule id="100826" level="10" frequency="3" timeframe="200" ignore="600">
+    <if_matched_group>phage_idle</if_matched_group>
+    <same_location />
+    <description>Phage: no kernel events in 3 consecutive heartbeats (sensors detached or blinded?).</description>
+  </rule>
+
   <!-- ===== Novelty rows ==================================================== -->
   <!-- Advisory (ADR-0036): a finding row repeats a response record that
        already alerts (100810), so it is kept at level 3; an unlearned row has
@@ -157,6 +189,7 @@
 
   <rule id="100830" level="0">
     <decoded_as>json</decoded_as>
+    <location>/var/lib/phage/novelty.jsonl</location>
     <field name="source_kind" type="pcre2">^heuristic$</field>
     <field name="uid" type="pcre2">^phage-[0-9a-f]+$</field>
     <description>Phage: novelty row.</description>
@@ -174,6 +207,12 @@
     <description>Phage novelty: $(profile) $(value) on $(entity_kind):$(entity) was never seen while learning (unlearned, advisory).</description>
   </rule>
 
+  <rule id="100833" level="7">
+    <if_sid>100830</if_sid>
+    <field name="message" type="pcre2">\(burst\)$</field>
+    <description>Phage novelty: a burst of new $(profile) rows on $(entity_kind):$(entity) (count $(count); the rest were not written).</description>
+  </rule>
+
   <!-- ===== Agent-side checks (command localfiles) ========================= -->
   <!-- Rule 530 is Wazuh's own "ossec: output:" rule for command output. -->
 
@@ -182,7 +221,7 @@
   <rule id="100840" level="12">
     <if_sid>530</if_sid>
     <match>^ossec: output: 'phage-heartbeat': </match>
-    <regex type="pcre2">status=(stale|missing)</regex>
+    <regex type="pcre2">status=(stale|missing|skew)</regex>
     <description>Phage: no heartbeat for 3 intervals (phaged stopped, wedged, or its audit trail is not being written).</description>
   </rule>
 

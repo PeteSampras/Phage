@@ -39,6 +39,7 @@ type rule struct {
 	IfSid          string    `xml:"if_sid"`
 	IfMatchedGroup string    `xml:"if_matched_group"`
 	DecodedAs      string    `xml:"decoded_as"`
+	Location       string    `xml:"location"`
 	Match          string    `xml:"match"`
 	Regex          *pattern  `xml:"regex"`
 	Fields         []pattern `xml:"field"`
@@ -123,8 +124,11 @@ func re(t *testing.T, p pattern) *regexp.Regexp {
 	return r
 }
 
-func matches(t *testing.T, r rule, fields map[string]string, line string, isJSON bool) bool {
+func matches(t *testing.T, r rule, fields map[string]string, line, location string, isJSON bool) bool {
 	if r.DecodedAs != "" && (r.DecodedAs != "json" || !isJSON) {
+		return false
+	}
+	if r.Location != "" && !strings.Contains(location, r.Location) {
 		return false
 	}
 	for _, f := range r.Fields {
@@ -154,6 +158,16 @@ func matches(t *testing.T, r rule, fields map[string]string, line string, isJSON
 // "ossec: output:" rule) is modelled for command output.
 func fire(t *testing.T, rules []rule, line string) string {
 	t.Helper()
+	loc := "(web01) any->/var/lib/phage/audit.jsonl"
+	if strings.Contains(line, `"source_kind"`) {
+		loc = "(web01) any->/var/lib/phage/novelty.jsonl"
+	}
+	return fireAt(t, rules, line, loc)
+}
+
+// fireAt is fire for an event read from location (as Wazuh names it).
+func fireAt(t *testing.T, rules []rule, line, location string) string {
+	t.Helper()
 	isJSON := strings.HasPrefix(line, "{")
 	var fields map[string]string
 	if isJSON {
@@ -165,7 +179,7 @@ func fire(t *testing.T, rules []rule, line string) string {
 	}
 	if cur == "" {
 		for _, r := range rules {
-			if r.IfSid == "" && r.IfMatchedGroup == "" && matches(t, r, fields, line, isJSON) {
+			if r.IfSid == "" && r.IfMatchedGroup == "" && matches(t, r, fields, line, location, isJSON) {
 				cur = r.ID
 				break
 			}
@@ -174,7 +188,7 @@ func fire(t *testing.T, rules []rule, line string) string {
 	for cur != "" {
 		next := ""
 		for _, r := range rules {
-			if r.IfSid == cur && matches(t, r, fields, line, isJSON) {
+			if r.IfSid == cur && matches(t, r, fields, line, location, isJSON) {
 				next = r.ID
 				break
 			}
@@ -262,6 +276,7 @@ func TestRulesFireOnPhageRecords(t *testing.T) {
 		"self-heal failed":    {line(t, selfHeal("failed:unsafe path")), "100816"},
 		"self-heal unchanged": {line(t, selfHeal("unchanged")), "100817"},
 		"heartbeat healthy":   {line(t, heartbeat(audit.Health{Events: 60, EventsPerSec: 1})), "100820"},
+		"heartbeat 10 events": {line(t, heartbeat(audit.Health{Events: 10})), "100820"},
 		"heartbeat drops":     {line(t, heartbeat(audit.Health{Drops: 12, DropsTotal: 40})), "100821"},
 		"heartbeat 10 drops":  {line(t, heartbeat(audit.Health{Drops: 10})), "100821"},
 		"novelty errors":      {line(t, heartbeat(audit.Health{NoveltyErrors: 3})), "100822"},
@@ -270,6 +285,10 @@ func TestRulesFireOnPhageRecords(t *testing.T) {
 		"novelty finding":     {line(t, id.Finding(ev, v, "none", time.Now())), "100831"},
 		"novelty high":        {line(t, id.Finding(ev, high, "none", time.Now())), "100831"},
 		"novelty unlearned":   {line(t, id.Unlearned(ev, []string{"net.egress_comm_id"}, "none", time.Now())), "100832"},
+		"novelty burst":       {line(t, id.Burst(id.Unlearned(ev, nil, "none", time.Now()), 21, time.Now())), "100833"},
+		"heartbeat idle":      {line(t, heartbeat(audit.Health{Events: 0})), "100825"},
+		"idle with drops":     {line(t, heartbeat(audit.Health{Events: 0, Drops: 4})), "100821"},
+		"heartbeat skew":      {"ossec: output: 'phage-heartbeat': status=skew age=-900 max=180", "100840"},
 		"heartbeat stale":     {"ossec: output: 'phage-heartbeat': status=stale age=412 max=180", "100840"},
 		"heartbeat missing":   {"ossec: output: 'phage-heartbeat': status=missing reason=no-heartbeat max=180", "100840"},
 		"heartbeat fresh":     {"ossec: output: 'phage-heartbeat': status=fresh age=12 max=180", "530"},
@@ -282,6 +301,12 @@ func TestRulesFireOnPhageRecords(t *testing.T) {
 	} {
 		if got := fire(t, rules, c.line); got != c.want {
 			t.Errorf("%s: fired %q, want %q\n  %s", name, got, c.want, c.line)
+		}
+	}
+	// The same records from another file trip nothing.
+	for _, l := range []string{line(t, startup("armed")), line(t, id.Unlearned(ev, nil, "none", time.Now()))} {
+		if got := fireAt(t, rules, l, "(web01) any->/var/log/app/events.json"); got != "" {
+			t.Errorf("a record from another file fired %s", got)
 		}
 	}
 }
@@ -419,6 +444,10 @@ func TestHeartbeatCheckScript(t *testing.T) {
 	write(at(hb, 10*time.Minute), at(response("notified", 0.5), time.Second))
 	if out := run("180", trail); !strings.HasPrefix(out, "status=stale") || fired(out) != "100840" {
 		t.Errorf("stale: %q", out)
+	}
+	write(at(hb, -time.Hour))
+	if out := run("180", trail); !strings.HasPrefix(out, "status=skew") || fired(out) != "100840" {
+		t.Errorf("future heartbeat: %q", out)
 	}
 	// A reason mentioning a heartbeat must not count as one.
 	fake := response("notified", 0.5)

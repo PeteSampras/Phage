@@ -33,19 +33,23 @@ systemctl restart wazuh-agent
 | `disarmed` | a start with a `-mode` downgrade that switched features off |
 | `response` | a verdict at or above `thresholds.notify`, an attack on the agent, or a decoy read: `requested`, `action`, `outcome`, `score` |
 | `self_heal` | a self-heal attempt (`enforcement.self_heal` only): `healed` / `unchanged` / `failed:<err>` |
-| `heartbeat` | every `output.heartbeat_interval` seconds (default 60), in every mode: `health.{events, events_per_sec, drops, drops_total, drops_error, enrich_lag_ms_avg, enrich_lag_ms_max, novelty_rows, novelty_suppressed, novelty_errors, baseline_overflow, checkpoint_errors}`, mode, armed features, `baseline_sha256` |
+| `heartbeat` | every `output.heartbeat_interval` seconds (default 60), in every mode: `health.{events, events_per_sec, drops, drops_total, drops_error, enrich_lag_ms_avg, enrich_lag_ms_max, novelty_rows, novelty_suppressed, novelty_over_cap, novelty_errors, baseline_overflow, baseline_samples, baseline_state, checkpoint_errors}`, mode, armed features, `baseline_sha256`, `baseline_state` |
 
 `health.drops` counts events the kernel sensors saw but could not queue for phaged (the ring
 buffer was full) during the interval. Any drop means detection was incomplete.
 
-**The novelty file**, `/var/lib/phage/novelty.jsonl` (alert and enforce mode only), one row in
-homelab-next's `novelty_finding` shape per verdict at or above `thresholds.notify` (`finding`,
-with `score`) and per event whose feature class was never seen while learning (`unlearned`, no
-score). Every row is `source_kind: heuristic`: advisory, never a basis to act alone. A finding
+**The novelty file**, `/var/lib/phage/novelty.jsonl` (opt-in: only when `output.novelty_path`
+is set; alert and enforce mode only), one row in homelab-next's `novelty_finding` shape per
+verdict at or above `thresholds.notify` (`finding`, with `score`), per event whose feature class
+was never seen while learning once the baseline is ready (`unlearned`, no score), and one
+`burst` row per profile per bucket once a profile passes `output.novelty_max_per_bucket` new
+rows. Every row is `source_kind: heuristic`: advisory, never a basis to act alone. A finding
 row repeats a `response` record, so its rule stays at level 3; an `unlearned` row has no
-response record and alerts at level 6. Getting rows into the lake's `novelty_finding` table is a
-separate step: they must be written by the lake's own writer under Phage's source (homelab-next
-ADR-0036 decision 6); Wazuh only carries them.
+response record and alerts at level 6; a `burst` row alerts at level 7. **The agent ships the
+file to the SIEM whatever its rows' TLP label says**: the label travels in each row, and
+neither the agent nor these rules enforce it. Getting rows into the lake's `novelty_finding`
+table is a separate step, not built yet: they must be written by the lake's own writer under
+Phage's source (homelab-next ADR-0036 decision 6); Wazuh only carries them.
 
 ## The rules
 
@@ -61,17 +65,20 @@ ADR-0036 decision 6); Wazuh only carries them.
 | 100810 | 8 | a response |
 | 100811 | 12 | a response that contained a process |
 | 100812 | 10 | a response whose actuation failed |
-| 100813 | 11 | a response with score 0.8 or more |
+| 100813 | 11 | a response with score 0.8 or more (the default `thresholds.contain`; rules cannot read the config, so edit the pattern if you change it) |
 | 100815 / 100816 / 100817 | 10 / 10 / 3 | self-heal healed / failed / unchanged |
 | 100820 | 0 | a heartbeat (parent) |
 | 100821 | 10 | a heartbeat with ring-buffer drops |
 | 100822 | 9 | a heartbeat with novelty rows that could not be written |
 | 100823 | 7 | the drop counter cannot be read (an old eBPF object); repeats at most hourly |
 | 100824 | 7 | baseline checkpoints have failed; repeats at most hourly |
+| 100825 | 0 | a heartbeat with zero events (counted by 100826) |
+| 100826 | 10 | three heartbeats with zero events within 200 s (sensors detached or blinded); scale the timeframe with the interval |
 | 100830 | 0 | a novelty row (parent) |
 | 100831 | 3 | a novelty finding |
 | 100832 | 6 | a novelty `unlearned` row |
-| 100840 | 12 | no heartbeat for three intervals (agent-side check) |
+| 100833 | 7 | a novelty `burst` row |
+| 100840 | 12 | no heartbeat for three intervals, or a heartbeat time more than that far in the future (agent-side check) |
 | 100841 | 12 | `phage.service` is not active (agent-side check) |
 
 ## Silence needs an agent-side check
@@ -85,15 +92,22 @@ The absence is turned into an event on the host instead. The agent runs `phage-h
 180` every 60 seconds (a `command` localfile). It finds the last `heartbeat` record in the audit
 trail and prints exactly one line: `status=fresh age=<s> max=180`, `status=stale age=<s>
 max=180`, or `status=missing reason=<why>` (no trail, no heartbeat in it, a time it cannot
-parse). Rule 100840 fires on `stale` and `missing`. 180 is three intervals of the default
+parse), or `status=skew` when the last heartbeat is more than `max` seconds in the future
+(a clock jump makes the age meaningless). Rule 100840 fires on `stale`, `missing` and `skew`.
+The script sets `PATH=/usr/bin:/bin` itself. 180 is three intervals of the default
 `output.heartbeat_interval: 60`; scale it with the interval. The check is read-only and needs
 GNU `date` and `tac`, and read access to the 0600 root trail (the agent's logcollector runs as
 root).
 
 Rule 100841 checks the service the same way, with `systemctl is-active phage.service`: any
 answer but `active` fires it, including `activating`, which is what a crash loop looks like
-between restarts. Rule 100804 is the other side of a crash loop: it counts `startup` records,
-which is what `frequency` can do.
+between restarts. Rule 100804 counts `startup` records (which is what `frequency` can do), so
+it sees only starts that got as far as writing one. A start that fails before that (a broken
+config, a full `/var`, an unopenable sink) writes nothing to count: 100841 and 100840 catch it.
+
+Rule 100826 is a frequency rule too: three heartbeats with `health.events` 0 within 200 s. A
+host where the sensors are attached but nothing arrives is detached or blinded; a busy server
+is never at zero, but a nearly idle one can be, so raise the count or drop the rule there.
 
 These checks cover phaged stopping, wedging, or failing to write its trail. They do not cover
 the Wazuh agent itself stopping; Wazuh's own agent-disconnected alert covers that.
@@ -104,11 +118,18 @@ Commands in a centralized `agent.conf` (rather than the agent's own `ossec.conf`
 ## Field names Wazuh may claim
 
 `status` and `action` (and `id`, `url`, `data`, `srcip` and a few more) are Wazuh static field
-names: the JSON decoder may store those keys as static fields, which `<field name="...">` does
-not match. So no rule depends on them. A startup record's status is read from the end of its
-`reason` (`phaged started: mode=alert status=armed`), and a novelty row is a finding when it has
-a `score` and unlearned when its `message` ends with `(unlearned)`. Phage's tests hold both
-formats.
+names. The JSON decoder may store those keys as static fields (matched by `<status>`,
+`<action>`) rather than as dynamic ones (matched by `<field name="...">`); which one your
+manager does has not been checked here. So no rule depends on either: a startup record's status
+is read from the end of its `reason` (`phaged started: mode=alert status=armed`), and a novelty
+row is a finding when it has a `score`, unlearned when its `message` ends with `(unlearned)` and
+a burst when it ends with `(burst)`. Phage's tests hold all three formats. Once `wazuh-logtest`
+shows how your manager stores `status`, matching `<status>^armed$</status>` (or the field) is
+equivalent, and simpler to read.
+
+The two parent rules are pinned to the files with `<location>` (`/var/lib/phage/audit.jsonl`,
+`/var/lib/phage/novelty.jsonl`), so another JSON log with similar keys cannot trip them. If you
+move the files, change the locations.
 
 ## Why the decoder file is nearly empty
 
@@ -136,6 +157,8 @@ manager and feed `/var/ossec/bin/wazuh-logtest` one line of each kind, for examp
 {"uid":"phage-0123456789abcdef0123456789abcdef01234567","time":"2026-11-04T10:02:00.000000Z","as_of":"2026-11-04T10:02:00.004000Z","source":"phage-host","source_kind":"heuristic","profile":"connect","entity_kind":"host","entity":"web01","value":"192.0.2.7:4444","status":"unlearned","support":0,"entity_total":0,"count":1,"message":"web01: connect 192.0.2.7:4444 by sh (pid 4242): this kind of event was never seen while learning, so it is not scored (unlearned)","reasons":["no observations in the baseline for net.egress_comm_id"],"tlp":"amber"}
 ```
 
-Expect 100802, 100821 and 100832. For the checks, `wazuh-logtest` takes the raw command line
+Expect 100802, 100821 and 100832 (logtest needs the location: feed the first two as read from
+`/var/lib/phage/audit.jsonl` and the third from `/var/lib/phage/novelty.jsonl`, or the
+`<location>` pins hide them). For the checks, `wazuh-logtest` takes the raw command line
 (`ossec: output: 'phage-heartbeat': status=stale age=412 max=180`, expect 100840). If a field
 rule does not match on your version, check how `wazuh-logtest` names the decoded field first.
