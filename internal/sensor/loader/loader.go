@@ -105,6 +105,16 @@ func (s *Sensor) SetHoneytokens(inodes []uint64) error {
 	return armed.Update(uint32(0), on, ebpf.UpdateAny)
 }
 
+// Drops returns the number of events the sensors failed to queue (a full ring
+// buffer) since they were loaded, summed over every CPU.
+func (s *Sensor) Drops() (uint64, error) {
+	m := s.coll.Maps[DropsMap]
+	if m == nil {
+		return 0, ErrNoDropCounter
+	}
+	return readDrops(m)
+}
+
 // Read returns the next raw event sample. It blocks until a sample arrives or
 // the Sensor is closed, in which case it returns ringbuf.ErrClosed.
 func (s *Sensor) Read() ([]byte, error) {

@@ -47,6 +47,33 @@ struct {
 	__uint(max_entries, 1 << 20); /* 1 MiB */
 } phage_events SEC(".maps");
 
+/* phage_drops counts events a sensor saw but could not hand to userspace
+ * because bpf_ringbuf_reserve failed (the ring buffer was full: phaged is not
+ * draining it fast enough, or it is wedged). A blinded sensor is silent; a
+ * drop counter makes that silence visible. Per-CPU, so the hot path never
+ * contends; userspace sums the slots (phage status, the heartbeat record). */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} phage_drops SEC(".maps");
+
+/* reserve_event reserves one event slot, counting a failed reservation. Every
+ * sensor reserves through here. The add is atomic: a sensor in interrupt
+ * context (signal_generate) can preempt another on the same CPU. */
+static __always_inline struct phage_event *reserve_event(void)
+{
+	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	if (!e) {
+		__u32 zero = 0;
+		__u64 *n = bpf_map_lookup_elem(&phage_drops, &zero);
+		if (n)
+			__sync_fetch_and_add(n, 1);
+	}
+	return e;
+}
+
 /* honeytokens maps a decoy file's inode number -> 1. Userspace plants the decoys
  * (fake credential files nothing legitimate references) and registers their
  * inodes; any open of one is a near-zero-false-positive sign of an intruder
@@ -180,7 +207,7 @@ static __always_inline void fill_common(struct phage_event *e,
 SEC("fentry/commit_creds")
 int BPF_PROG(on_commit_creds, struct cred *new)
 {
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -198,7 +225,7 @@ int BPF_PROG(on_commit_creds, struct cred *new)
 SEC("tp_btf/sched_process_exec")
 int BPF_PROG(on_sched_exec, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
 {
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -243,7 +270,7 @@ int BPF_PROG(on_tcp_connect, struct sock *sk)
 	}
 	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
 
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -316,7 +343,7 @@ int BPF_PROG(on_file_open, struct file *file)
 		if (bpf_map_lookup_elem(&honeytokens, &ino)) {
 			char hbuf[256];
 			long hlen = bpf_d_path((struct path *)&file->f_path, hbuf, sizeof(hbuf));
-			struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+			struct phage_event *e = reserve_event();
 			if (e) {
 				struct task_struct *t = bpf_get_current_task_btf();
 				fill_common(e, t, PHAGE_EVT_HONEYTOKEN);
@@ -340,7 +367,7 @@ int BPF_PROG(on_file_open, struct file *file)
 	if (!watched_path(buf))
 		return 0;
 
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -355,7 +382,7 @@ int BPF_PROG(on_file_open, struct file *file)
  * the setup phase of a kernel exploit or container escape, before escalation. */
 static __always_inline int emit_enable(__u32 op)
 {
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *task = bpf_get_current_task_btf();
@@ -415,7 +442,7 @@ int BPF_PROG(on_signal_generate, int sig, void *info, struct task_struct *task,
 	    sig != SIG_TERM && sig != SIG_STOP)
 		return 0;
 
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *cur = bpf_get_current_task_btf();
@@ -441,7 +468,7 @@ int BPF_PROG(on_ptrace_attach, struct task_struct *task)
 	if (sender == self)
 		return 0;
 
-	struct phage_event *e = bpf_ringbuf_reserve(&phage_events, sizeof(*e), 0);
+	struct phage_event *e = reserve_event();
 	if (!e)
 		return 0;
 	struct task_struct *cur = bpf_get_current_task_btf();

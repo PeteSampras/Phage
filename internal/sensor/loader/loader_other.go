@@ -25,5 +25,8 @@ func (s *Sensor) SetSelfPID(pid uint32) error { return nil }
 // SetHoneytokens is a no-op off Linux.
 func (s *Sensor) SetHoneytokens(inodes []uint64) error { return nil }
 
+// Drops always fails off Linux.
+func (s *Sensor) Drops() (uint64, error) { return 0, ErrUnsupported }
+
 // Close is a no-op off Linux.
 func (s *Sensor) Close() error { return nil }
