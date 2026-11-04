@@ -80,8 +80,16 @@ func (m *Manager) Seed() ([]Planted, error) {
 		}
 		delete(prev, d.Path)
 	}
-	// Records for decoys no longer in the set: clean them up the safe way.
+	// Records for decoys no longer in the set: clean them up the safe way —
+	// but only if the record claims the content of a decoy this build knows.
+	// A record is data on disk; it must not be able to name an arbitrary
+	// hash (and so an arbitrary file's content) for deletion.
+	known := m.knownHashes()
 	for _, p := range prev {
+		if !known[p.SHA256] {
+			log.Printf("honeytoken: leftover record for %q has an unknown content hash; leaving the file", p.Path)
+			continue
+		}
 		removeOne(*p)
 	}
 	if err := m.save(out); err != nil {
@@ -254,6 +262,18 @@ func Inodes(planted []Planted) []uint64 {
 	out := make([]uint64, 0, len(planted))
 	for _, p := range planted {
 		out = append(out, p.Ino)
+	}
+	return out
+}
+
+// knownHashes is the set of content hashes of every decoy this build plants
+// (the configured set and the default set).
+func (m *Manager) knownHashes() map[string]bool {
+	out := map[string]bool{}
+	for _, set := range [][]Decoy{m.decoys, Decoys} {
+		for _, d := range set {
+			out[sum(d.Content)] = true
+		}
 	}
 	return out
 }

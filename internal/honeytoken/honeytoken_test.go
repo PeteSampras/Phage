@@ -130,3 +130,40 @@ func TestSeedDoesNotFollowSymlink(t *testing.T) {
 		t.Fatalf("decoy written through a symlink: %q", b)
 	}
 }
+
+// A leftover record (decoy no longer in the set) is cleaned up only if its
+// hash is a known decoy's: a tampered record cannot get a real file deleted
+// by naming that file's own hash.
+func TestLeftoverRecordNeedsKnownDecoyHash(t *testing.T) {
+	e := newEnv(t)
+	real := filepath.Join(e.root, "real-secret")
+	os.WriteFile(real, []byte("REAL\n"), 0o600)
+	fi, _ := os.Lstat(real)
+	n := nodeOf(real, fi)
+	forged := []Planted{{Node: n, SHA256: sum("REAL\n")}}
+	m := New(e.state, e.decoys)
+	if err := m.save(forged); err != nil {
+		t.Fatal(err)
+	}
+	planted, err := m.Seed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	Remove(planted)
+	if b, err := os.ReadFile(real); err != nil || string(b) != "REAL\n" {
+		t.Fatalf("a file named by a forged record was removed: %q %v", b, err)
+	}
+
+	// A genuine leftover (a decoy dropped from the set) is still cleaned up.
+	old := Decoy{filepath.Join(e.root, "old-decoy"), "decoy-old\n"}
+	m1 := New(e.state, append(e.decoys, old))
+	if _, err := m1.Seed(); err != nil {
+		t.Fatal(err)
+	}
+	m2 := New(e.state, append(e.decoys, Decoy{filepath.Join(e.root, "renamed-decoy"), "decoy-old\n"})) // same content still known
+	got, _ := m2.Seed()
+	Remove(got)
+	if exists(old.Path) {
+		t.Error("a leftover decoy with a known hash should be removed")
+	}
+}
