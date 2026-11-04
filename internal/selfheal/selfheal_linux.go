@@ -242,7 +242,7 @@ func heal(path string, snap snapshot, quarantine string) (string, error) {
 	if len(cur) > 0 {
 		name := fmt.Sprintf("%d-%s", time.Now().Unix(), sanitize(path))
 		if n, err := writeExcl(qfd, name, cur, os.Getuid(), os.Getgid(), 0o600); err != nil {
-			log.Printf("self-heal %s: evidence not saved: %v", path, err)
+			log.Printf("self-heal %q: evidence not saved: %v", path, err)
 		} else {
 			qpath = filepath.Join(quarantine, n)
 		}

@@ -370,12 +370,15 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	// first question; keep it in the reason and the audit trail even though the
 	// learned feature is the coarse class, not the path.
 	if ev.Kind == kind.FileWrite && ev.File.Path != "" {
-		reason = fmt.Sprintf("%s (wrote %s)", reason, ev.File.Path)
+		reason = fmt.Sprintf("%s (wrote %q)", reason, ev.File.Path)
 	}
 	if ev.Kind == kind.Enable && ev.EnableOp != "" {
-		reason = fmt.Sprintf("%s (op: %s)", reason, ev.EnableOp)
+		reason = fmt.Sprintf("%s (op: %q)", reason, ev.EnableOp)
 	}
-	log.Printf("%s score=%.2f action=%s pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: %s",
+	// Every attacker-influenced string (comm, parent, the reason — which embeds
+	// paths and executable names) is printed with %q, so a crafted name holding a
+	// newline or control bytes cannot forge an extra journal line.
+	log.Printf("%s score=%.2f action=%s pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=%q",
 		strings.ToUpper(labelFor(v.Score)), v.Score, want,
 		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
 
@@ -646,11 +649,11 @@ func (a *App) selfHeal(path string) {
 	time.Sleep(250 * time.Millisecond) // let the write complete, then revert it
 	q, err := a.healer.Heal(path)
 	if err != nil {
-		log.Printf("self-heal %s failed: %v", path, err)
+		log.Printf("self-heal %q failed: %v", path, err)
 		return
 	}
 	if q != "" {
-		log.Printf("SELF-HEALED %s (restored known-good; attacker version saved to %s)", path, q)
+		log.Printf("SELF-HEALED %q (restored known-good; attacker version saved to %q)", path, q)
 	}
 }
 

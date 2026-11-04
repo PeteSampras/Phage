@@ -2,13 +2,16 @@ package app
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/AzozzALFiras/Phage/internal/agent/config"
+	"github.com/AzozzALFiras/Phage/internal/analysis/verdict"
 	"github.com/AzozzALFiras/Phage/internal/audit"
+	"github.com/AzozzALFiras/Phage/internal/event/kind"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"github.com/AzozzALFiras/Phage/internal/response/action"
@@ -207,5 +210,32 @@ func TestSupervisorIsByPID(t *testing.T) {
 	}
 	if !a.isSelf(selfPID) || a.isSelf(fakePhagedPID) {
 		t.Error("isSelf must match the agent's tgid only")
+	}
+}
+
+// A path or comm is attacker-chosen; one with a newline must not be able to
+// forge a second journal line.
+func TestRespondLogCannotBeLineForged(t *testing.T) {
+	var buf strings.Builder
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) }()
+
+	c := config.Default()
+	c.Mode = mode.Alert
+	a := &App{cfg: c, contained: map[int32]*contState{}, recentLimit: 10}
+	ev := model.Event{
+		Kind: kind.FileWrite, PID: 77, Comm: "x\nCRITICAL fake",
+		File: model.FileWrite{Path: "/etc/cron.d/a\nCRITICAL self-defense: forged line"},
+	}
+	a.respond(ev, verdict.Verdict{Score: 0.9}, action.Notify)
+
+	out := strings.TrimSuffix(buf.String(), "\n")
+	if strings.Contains(out, "\n") {
+		t.Fatalf("one verdict produced more than one log line:\n%s", out)
+	}
+	if !strings.Contains(out, `\nCRITICAL self-defense`) {
+		t.Errorf("the newline in the path should appear escaped: %s", out)
 	}
 }
