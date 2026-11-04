@@ -479,16 +479,51 @@ func TestHealPreservesOwner(t *testing.T) {
 	os.Chown(f.sshDir, 4242, 4242)
 	os.Chown(f.target, 4242, 4243)
 	mustSnapshot(t, f)
-	writeFile(t, f.target, "evil\n", 0o640)
-	os.Chown(f.target, 0, 0)
+	writeFile(t, f.target, "evil\n", 0o666) // tampered in place: owner unchanged, mode loosened
+	os.Chown(f.target, 4242, 0)             // group changed
 
 	if _, err := f.store.Heal(f.target); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	var st syscall.Stat_t
 	syscall.Lstat(f.target, &st)
-	if st.Uid != 4242 || st.Gid != 4243 {
-		t.Errorf("owner = %d:%d, want original 4242:4243", st.Uid, st.Gid)
+	if st.Uid != 4242 || st.Gid != 4243 || st.Mode&0o777 != 0o640 {
+		t.Errorf("owner/mode = %d:%d %o, want original 4242:4243 640", st.Uid, st.Gid, st.Mode&0o777)
+	}
+}
+
+// The heal must never hand a file back to an old owner: if the owner changed
+// since the snapshot (an admin made alice's file root-owned), refuse.
+func TestHealRefusesOwnerChange(t *testing.T) {
+	requireRoot(t)
+	f := newFixture(t)
+	os.Chown(f.sshDir, 4242, 4242)
+	os.Chown(f.target, 4242, 4242)
+	mustSnapshot(t, f)
+	writeFile(t, f.target, "admin-revoked-alice-key\n", 0o600)
+	os.Chown(f.target, 0, 0)
+	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
+		t.Fatalf("Heal after an owner change: err = %v, want ErrUnsafe", err)
+	}
+	var st syscall.Stat_t
+	syscall.Lstat(f.target, &st)
+	if b, _ := os.ReadFile(f.target); string(b) != "admin-revoked-alice-key\n" || st.Uid != 0 {
+		t.Fatalf("file changed by a refused heal: %q uid %d", b, st.Uid)
+	}
+}
+
+func TestCurrentOwner(t *testing.T) {
+	requireRoot(t)
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	os.Chown(f.target, 4242, 4242)
+	if uid, err := f.store.CurrentOwner(f.target); err != nil || uid != 4242 {
+		t.Errorf("CurrentOwner = %d, %v; want the owner now (4242), not at snapshot", uid, err)
+	}
+	os.Remove(f.target)
+	os.Chown(f.sshDir, 4343, 4343)
+	if uid, err := f.store.CurrentOwner(f.target); err != nil || uid != 4343 {
+		t.Errorf("absent file: CurrentOwner = %d, %v; want the directory owner 4343", uid, err)
 	}
 }
 

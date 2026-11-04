@@ -155,12 +155,14 @@ func (s *Store) Heal(path string) (Result, error) {
 	return heal(path, snap, s.quarantine, s.quotaBytes)
 }
 
-// Owner returns the uid that owned path when it was snapshotted.
-func (s *Store) Owner(path string) (int, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	snap, ok := s.good[filepath.Clean(path)]
-	return snap.uid, ok
+// CurrentOwner returns the uid that owns path NOW, read without following a
+// symlink through the verified parent directory (the directory's owner if the
+// file is absent: whoever could have removed it). The self-heal gate uses it
+// to decide whether a writer could have written the host file at all; the
+// snapshot owner must never be used for that, because ownership can change
+// after the snapshot.
+func (s *Store) CurrentOwner(path string) (int, error) {
+	return currentOwner(filepath.Clean(path))
 }
 
 // Claim asks to heal path. It returns true if the caller now owns the heal

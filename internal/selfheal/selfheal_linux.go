@@ -281,6 +281,16 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 			ErrUnsafe, path, dst.Uid, snap.uid)
 	}
 
+	// Never restore an old owner: if the file now belongs to someone other
+	// than its owner at snapshot time (e.g. an admin made a user's file
+	// root-owned), a heal would hand the file back to the snapshot owner along
+	// with the old content. Refuse; the caller audits it.
+	var cst unix.Stat_t
+	if err := unix.Fstatat(dirfd, filepath.Base(path), &cst, unix.AT_SYMLINK_NOFOLLOW); err == nil && int(cst.Uid) != snap.uid {
+		return Result{}, fmt.Errorf("%w: owner of %q changed since the snapshot (uid %d then, %d now); refusing to restore the old owner",
+			ErrUnsafe, path, snap.uid, cst.Uid)
+	}
+
 	evidence, unchanged, err := currentEvidence(dirfd, path, snap)
 	if err != nil {
 		return Result{}, err
@@ -315,6 +325,23 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 		return Result{Evidence: qpath}, fmt.Errorf("atomic restore: %w", err)
 	}
 	return Result{Healed: true, Evidence: qpath}, nil
+}
+
+func currentOwner(path string) (int, error) {
+	dirfd, dst, err := openParent(path)
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(dirfd)
+	var st unix.Stat_t
+	err = unix.Fstatat(dirfd, filepath.Base(path), &st, unix.AT_SYMLINK_NOFOLLOW)
+	if err == unix.ENOENT {
+		return int(dst.Uid), nil
+	}
+	if err != nil {
+		return -1, err
+	}
+	return int(st.Uid), nil
 }
 
 // saveEvidence writes one evidence file into the quarantine dir and prunes the

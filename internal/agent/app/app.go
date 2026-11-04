@@ -68,10 +68,10 @@ type App struct {
 	getppid func() int
 	proc    procView // /proc reads (fake in tests)
 
-	healGate  func(v procView, pid int32, path string, writerUID, ownerUID int) (bool, string) // writer-view check before a heal
-	healDelay func()                                                                           // pause before a heal (the write lands)
-	healWG    sync.WaitGroup                                                                   // running heals (tests wait on it)
-	sshd      *sshdIdentity                                                                    // host sshd binaries by inode
+	healGate  func(v procView, pid int32, path string, writerUID, currentOwner int) (bool, string) // writer check before a heal
+	healDelay func()                                                                               // pause before a heal (the write lands)
+	healWG    sync.WaitGroup                                                                       // running heals (tests wait on it)
+	sshd      *sshdIdentity                                                                        // host sshd binaries by inode
 
 	started time.Time
 	// counters and the recent-alerts ring back the control interface.
@@ -394,7 +394,12 @@ func (a *App) maybeHeal(ev model.Event, v verdict.Verdict, reason string) string
 	// The event's path was resolved in the WRITER's view of the filesystem.
 	// Heal only if that names the host's sentinel inode (or, writer gone, let
 	// the host file's own content decide).
-	owner, _ := a.healer.Owner(ev.File.Path)
+	owner, err := a.healer.CurrentOwner(ev.File.Path)
+	if err != nil {
+		why := fmt.Sprintf("cannot read the current owner of %s: %v", ev.File.Path, err)
+		log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
+		return fmt.Sprintf("%s [self-heal skipped: %s]", reason, why)
+	}
 	if ok, why := a.healGate(a.proc, ev.PID, ev.File.Path, int(ev.Creds.UID), owner); !ok {
 		log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
 		return fmt.Sprintf("%s [self-heal skipped: %s]", reason, why)

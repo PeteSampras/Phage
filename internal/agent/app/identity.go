@@ -233,44 +233,42 @@ func containmentSafe(ev model.Event, self int32, v procView, sshd *sshdIdentity)
 	return true, ""
 }
 
-// writerSeesHostFile decides whether a malicious write reported at path may
-// trigger a heal of the HOST file at path. The event's path was resolved in
-// the writer's view of the filesystem, which can differ from the host's (a
-// container, or `unshare -m`). A namespace comparison is the wrong test: a new
-// mount namespace that has not remounted anything still writes the host inode.
+// writerSeesHostFile decides whether a malicious write-open reported at path
+// may trigger a heal of the HOST file at path. Two conditions, both required:
 //
-//  1. Resolve path inside the writer's root (/proc/<pid>/root, no symlinks).
-//     The host's inode: heal. A different file (its own namespace's copy):
-//     do not heal.
-//  2. If that view cannot be read (the writer exited, or removed its private
-//     copy), the host file's content alone must NOT decide: an unprivileged
-//     user can write a private copy in its own namespace, delete it, and so
-//     make the agent revert an admin's later, legitimate edit of the host file
-//     to the startup snapshot. So the fallback heals only if the writer could
-//     have written the host file at all: its real uid (init namespace, from
-//     the kernel event) is 0 or the sentinel's owner.
+//  1. The writer could have written the host file at all: its real uid in the
+//     init namespace (ev.Creds.UID) is 0 or the host file's CURRENT owner
+//     (read at decision time; the directory's owner if the file is absent).
+//     This is checked FIRST and on every branch. Without it, an unprivileged
+//     user in its own user+mount namespace can write a private copy at the
+//     same path (that is the event) and then remove it — rm, or umount of a
+//     tmpfs over the directory, after which its view resolves to the host
+//     inode again — and make the agent revert an admin's later edit of a
+//     root-owned file to the startup snapshot.
+//  2. The writer's view does not name a different file: path resolved inside
+//     /proc/<pid>/root (no symlinks) must be the host's dev+ino. A definitely
+//     different file (a container's own copy) skips the heal even for root.
+//     If the view cannot be resolved (writer gone, copy removed), condition 1
+//     alone decides, and Heal then compares the host file's content with the
+//     snapshot.
 //
-// writerUID is ev.Creds.UID. The file sensor does not capture euid/fsuid for
-// file-open events (Creds.EUID is not populated there), so the real uid is the
-// only writer identity available; a setuid-root writer whose real uid is a
-// user is therefore NOT healed by the fallback (fail safe: no wrongful revert).
-func writerSeesHostFile(v procView, pid int32, path string, writerUID, ownerUID int) (bool, string) {
+// The sensor does not capture euid/fsuid for file-open events, so the real
+// uid is the only writer identity: a setuid-root writer run by a user is not
+// healed (fail safe, still alerted), and container root without a user
+// namespace remap (real uid 0) counts as root.
+func writerSeesHostFile(v procView, pid int32, path string, writerUID, currentOwner int) (bool, string) {
+	if writerUID != 0 && writerUID != currentOwner {
+		return false, fmt.Sprintf("writer uid %d is neither root nor the current owner (uid %d) of %s: it could not have written the host file",
+			writerUID, currentOwner, path)
+	}
 	host, herr := lstatID(path)
 	if herr == nil && v != nil {
-		w, err := v.RootFileID(pid, path)
-		if err == nil {
-			if w == host {
-				return true, ""
-			}
+		if w, err := v.RootFileID(pid, path); err == nil && w != host {
 			return false, fmt.Sprintf("writer pid %d resolves %s to a different file (dev %d ino %d) than the host's (dev %d ino %d) — its own namespace's copy",
 				pid, path, w.dev, w.ino, host.dev, host.ino)
 		}
 	}
-	if writerUID == 0 || writerUID == ownerUID {
-		return true, "" // writer could have written the host file: its content decides
-	}
-	return false, fmt.Sprintf("writer pid %d's view of %s is gone and its uid %d (neither root nor the file owner %d) could not have written the host file",
-		pid, path, writerUID, ownerUID)
+	return true, ""
 }
 
 func lstatID(path string) (fileID, error) {

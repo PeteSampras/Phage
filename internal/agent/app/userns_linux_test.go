@@ -53,12 +53,17 @@ func sentinel(t *testing.T) string {
 	return p
 }
 
-// A user+mount namespace that remounts nothing writes the HOST inode: heal.
+// A user+mount namespace that remounts nothing writes the HOST inode: a root
+// writer (or the file's current owner) heals; an unprivileged non-owner never
+// does, whatever its view resolves to.
 func TestRealWriterInNewMountNSSeesHostFile(t *testing.T) {
-	host := sentinel(t)
+	host := sentinel(t) // root-owned
 	pid := spawnUserNS(t, "true")
-	if ok, why := writerSeesHostFile(hostProc{}, pid, host, 4242, 0); !ok {
-		t.Fatalf("unshare -Urm without remount writes the host inode and must heal: %s", why)
+	if ok, why := writerSeesHostFile(hostProc{}, pid, host, 0, 0); !ok {
+		t.Fatalf("a root writer in unshare -Urm without remount writes the host inode and must heal: %s", why)
+	}
+	if ok, _ := writerSeesHostFile(hostProc{}, pid, host, 4242, 0); ok {
+		t.Fatal("uid 4242 must not heal a root-owned file, even though its view is the host inode")
 	}
 }
 

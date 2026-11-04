@@ -12,3 +12,4 @@ var errUnsupported = errors.New("self-heal is supported on Linux only")
 func prepareQuarantine(string) error                       { return errUnsupported }
 func readSnapshot(string) (snapshot, error)                { return snapshot{}, errUnsupported }
 func heal(string, snapshot, string, int64) (Result, error) { return Result{}, errUnsupported }
+func currentOwner(string) (int, error)                     { return -1, errUnsupported }
