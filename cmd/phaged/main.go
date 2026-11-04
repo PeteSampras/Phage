@@ -31,10 +31,13 @@ func main() {
 	auditPath := flag.String("audit", defaults.AuditPath, "append-only action audit log (empty disables)")
 	controlPath := flag.String("control", defaults.ControlPath, "control socket for the phage CLI (empty disables)")
 	modeName := flag.String("mode", defaults.Mode.String(), "operating mode: learn | alert | enforce")
-	protect := flag.Bool("protect", false, "arm eBPF-LSM tamper-resistance: deny signals that would kill the agent (needs BPF LSM; systemctl/reboot still stop it)")
-	honeytokens := flag.Bool("honeytokens", false, "plant decoy credential files; any read of one is a high-confidence intrusion alert")
-	heal := flag.Bool("heal", false, "self-heal: restore sentinel files (authorized_keys/cron/...) after a malicious write, keeping the attacker's version as evidence (enforce)")
-	releaseAfter := flag.Int("release-after", 300, "seconds of quiet before a contained process is automatically released (graduated de-escalation)")
+	// The acting-feature flags mirror the YAML `enforcement:` keys. They are
+	// accepted only together with mode enforce: phaged refuses to start if one is
+	// set in learn or alert mode (fail closed). Prefer the config file.
+	protect := flag.Bool("protect", false, "same as enforcement.self_protect: eBPF-LSM tamper-resistance, deny signals that would kill the agent (REQUIRES mode enforce; needs BPF LSM; systemctl/reboot still stop it)")
+	honeytokens := flag.Bool("honeytokens", false, "same as enforcement.honeytokens: plant decoy credential files; any read of one is a high-confidence intrusion alert (REQUIRES mode enforce)")
+	heal := flag.Bool("heal", false, "same as enforcement.self_heal: restore sentinel files (authorized_keys/cron/...) after a malicious write, keeping the attacker's version as evidence (REQUIRES mode enforce)")
+	releaseAfter := flag.Int("release-after", defaults.ReleaseAfter, "same as release_after: seconds of quiet before an isolated process is automatically released (graduated de-escalation)")
 	flag.Parse()
 
 	// Base config: the file if given (validated on load), else the defaults.
@@ -68,17 +71,19 @@ func main() {
 		cfg.ControlPath = *controlPath
 	}
 	if set["protect"] {
-		cfg.Protect = *protect
+		cfg.Enforcement.SelfProtect = *protect
 	}
 	if set["honeytokens"] {
-		cfg.Honeytokens = *honeytokens
+		cfg.Enforcement.Honeytokens = *honeytokens
 	}
 	if set["heal"] {
-		cfg.Heal = *heal
+		cfg.Enforcement.SelfHeal = *heal
 	}
 	if set["release-after"] {
 		cfg.ReleaseAfter = *releaseAfter
 	}
+	// Validate is where the fail-closed rule lives: any acting feature requested
+	// (from the file or a flag) outside mode enforce is a startup error.
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("phaged: %v", err)
 	}

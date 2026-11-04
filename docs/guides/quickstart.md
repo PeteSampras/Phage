@@ -38,6 +38,8 @@ sudo phaged -config /etc/phage/phage.yaml
 ```
 Any flag overrides the file for that run — e.g. `sudo phaged -config
 /etc/phage/phage.yaml -mode alert` to try alert mode without editing the file.
+Acting features are the exception in spirit: they belong in the config file's
+`enforcement:` block and are refused outside `mode: enforce`.
 Let it learn for at least a week (`learn_window`). It is building the baseline of
 how your server normally behaves. It will not alert or act in this phase — that
 is correct.
@@ -51,8 +53,16 @@ phage events          # live anomalies with their reasons
 Tune `thresholds.notify` until the signal is trustworthy.
 
 ## Graduate to enforce
-Only when you trust the alerts, set `mode: enforce`. Default containment is a
-reversible **freeze**; a mistakenly frozen process can be released, nothing is
-killed unless you opt in.
+Only when you trust the alerts, set `mode: enforce` **and** turn on the acting
+features you want in the `enforcement:` block (all default off — with none on,
+enforce only alerts):
+```yaml
+mode: enforce
+enforcement:
+  isolate: true    # network quarantine for egress/C2 verdicts
+  freeze: true     # reversible cgroup freeze; release with `phage thaw <pid>`
+```
+Setting an `enforcement:` key (or `-heal`/`-protect`/`-honeytokens`) in learn or
+alert mode is a startup error. Nothing is ever killed.
 
 See [modes](../concepts/modes.md) for why this ordering matters.

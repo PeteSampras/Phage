@@ -262,20 +262,31 @@ phage thaw <pid>            # manually release a contained process
 2. **Alert** — when the baseline is mature, set `mode: alert` in
    `/etc/phage/phage.yaml` and `systemctl restart phage`. Now it scores and warns
    but still never acts; this is where you confirm it's quiet on a normal day.
-3. **Enforce** — only then set `mode: enforce`. Now it contains, proportionally
-   and reversibly (see [How it responds](#how-it-responds)), with the guardrails
-   that it will never freeze your SSH session or the control plane.
+3. **Enforce** — only then set `mode: enforce` **and** switch on, one by one,
+   the acting features you want in the `enforcement:` block of
+   `/etc/phage/phage.yaml`. Now it contains, proportionally and reversibly (see
+   [How it responds](#how-it-responds)), with the guardrails that it will never
+   freeze your SSH session or the control plane.
 
-Turn on the opt-in defences (honeytokens, self-heal, tamper-resistance) once you
-reach alert/enforce by adding flags with a drop-in — `systemctl edit phage`:
+**In this fork nothing acts by default, even in enforce mode.** Every acting
+feature — `isolate` (network quarantine), `freeze`, `self_heal`, `self_protect`
+(eBPF-LSM tamper-resistance) and `honeytokens` — is off until its own key is set,
+and is honoured only with `mode: enforce`; phaged refuses to start if one is set
+in learn or alert mode. When any arms, phaged logs one `ENFORCEMENT ARMED` line
+and writes an `enforcement_armed` audit record. See [FORK.md](FORK.md).
 
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/local/bin/phaged -config /etc/phage/phage.yaml \
-    -bpf /usr/local/lib/phage/sensors.bpf.o \
-    -honeytokens -heal -protect
+```yaml
+mode: enforce
+enforcement:
+  isolate: true        # sever egress of a process on a high egress/C2 verdict
+  freeze: false
+  self_heal: true
+  self_protect: false
+  honeytokens: true
 ```
+
+The old `-honeytokens -heal -protect` flags still exist as overrides for the
+matching keys, under the same rule: they are refused unless the mode is enforce.
 
 To remove everything: `sudo make uninstall` from the clone — it keeps your config
 and baseline unless you also delete `/etc/phage` and `/var/lib/phage`.

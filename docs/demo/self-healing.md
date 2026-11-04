@@ -6,7 +6,7 @@ malicious write and restores the known-good version a moment later, keeping the
 attacker's version as evidence.
 
 ## How it works
-With `phaged -heal`, the agent snapshots a small, high-value sentinel set at
+With `mode: enforce` and `enforcement.self_heal: true` (or `-heal`, which is refused outside enforce), the agent snapshots a small, high-value sentinel set at
 startup — SSH `authorized_keys` (root and each home), `/etc/crontab`, `/etc/cron.d/*`,
 `/etc/ld.so.preload`. When the file sensor raises a **malicious-write verdict**
 (enforce) against one of them, the agent lets the write land, then atomically

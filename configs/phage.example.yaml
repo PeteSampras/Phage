@@ -19,4 +19,21 @@ log_level: info
 # Tune aggressiveness here instead of in code.
 thresholds:
   notify: 0.4   # at/above this score, raise an alert
-  contain: 0.8  # at/above this score, contain (enforce mode only)
+  contain: 0.8  # at/above this score, contain (enforce mode + an armed enforcement feature only)
+
+# Seconds an ISOLATED process must stay quiet before it is automatically
+# released (graduated de-escalation). Frozen processes are never auto-released.
+release_after: 300
+
+# Acting features. EVERY ONE IS OFF BY DEFAULT and each arms only when
+# `mode: enforce` AND its own key below is true. phaged refuses to start if any
+# of them is true in learn or alert mode (fail closed). Without this block,
+# enforce mode scores and alerts exactly like alert mode — nothing acts.
+# When any feature arms, phaged logs one "ENFORCEMENT ARMED" line and writes an
+# `enforcement_armed` audit record so a SIEM can alert on it.
+enforcement:
+  isolate: false       # network quarantine: sever egress of a process on a high egress/C2 verdict
+  freeze: false        # cgroup-freeze a process tree on a high-confidence verdict (held for `phage thaw`)
+  self_heal: false     # restore authorized_keys/cron/ld.so.preload after a malicious write
+  self_protect: false  # eBPF-LSM: deny signals that would kill the agent (needs BPF LSM)
+  honeytokens: false   # plant decoy credential files; a read of one is a high-confidence alert

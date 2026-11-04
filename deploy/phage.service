@@ -8,13 +8,10 @@ Wants=network-online.target
 Type=simple
 # Starts in whatever mode /etc/phage/phage.yaml sets — which ships as `learn`.
 # NEVER change that to enforce on a fresh install; climb learn -> alert -> enforce.
-# To turn on the opt-in defences once you reach alert/enforce, add flags with a
-# drop-in:  systemctl edit phage
-#   [Service]
-#   ExecStart=
-#   ExecStart=/usr/local/bin/phaged -config /etc/phage/phage.yaml \
-#       -bpf /usr/local/lib/phage/sensors.bpf.o \
-#       -honeytokens -heal -protect
+# Acting features (isolate, freeze, self_heal, self_protect, honeytokens) are
+# turned on ONLY in the `enforcement:` block of /etc/phage/phage.yaml, and only
+# take effect with `mode: enforce`; phaged refuses to start if one is enabled in
+# learn or alert mode. Do not add -heal/-protect/-honeytokens here.
 ExecStart=/usr/local/bin/phaged -config /etc/phage/phage.yaml -bpf /usr/local/lib/phage/sensors.bpf.o
 
 Restart=on-failure
@@ -22,7 +19,7 @@ RestartSec=5s
 
 # phaged is a host defence agent: it loads eBPF programs (CAP_BPF / CAP_SYS_ADMIN
 # / CAP_PERFMON), attaches LSM/tracing/cgroup hooks, drives the cgroup-v2 freezer,
-# reads every process, and (with -heal) rewrites sentinel files anywhere on disk.
+# reads every process, and (with enforcement.self_heal) rewrites sentinel files anywhere on disk.
 # That needs full host privilege, so it runs as root and is intentionally NOT
 # sandboxed — tight ProtectSystem/ProtectHome/caps would break detection and
 # self-heal. By design, `systemctl stop` and reboot always stop it cleanly.

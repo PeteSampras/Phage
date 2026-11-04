@@ -3,7 +3,10 @@ package app
 import (
 	"testing"
 
+	"github.com/AzozzALFiras/Phage/internal/agent/config"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
+	"github.com/AzozzALFiras/Phage/internal/policy/mode"
+	"github.com/AzozzALFiras/Phage/internal/response/action"
 )
 
 // These tests lock in the containment safety contract. They exist because
@@ -54,6 +57,35 @@ func TestContainmentSafe(t *testing.T) {
 	for _, c := range cases {
 		if ok, _ := containmentSafe(c.ev); ok {
 			t.Errorf("%s: must NOT be containable", c.name)
+		}
+	}
+}
+
+func TestGateDowngradesUnarmedRungs(t *testing.T) {
+	mk := func(m mode.Mode, e config.Enforcement) *App {
+		c := config.Default()
+		c.Mode, c.Enforcement = m, e
+		return &App{cfg: c}
+	}
+	all := config.Enforcement{Isolate: true, Freeze: true}
+	cases := []struct {
+		name string
+		app  *App
+		in   action.Type
+		want action.Type
+	}{
+		{"enforce, nothing armed: isolate alerts", mk(mode.Enforce, config.Enforcement{}), action.Isolate, action.Notify},
+		{"enforce, nothing armed: freeze alerts", mk(mode.Enforce, config.Enforcement{}), action.Freeze, action.Notify},
+		{"enforce, isolate armed", mk(mode.Enforce, config.Enforcement{Isolate: true}), action.Isolate, action.Isolate},
+		{"enforce, only isolate armed: freeze alerts", mk(mode.Enforce, config.Enforcement{Isolate: true}), action.Freeze, action.Notify},
+		{"enforce, freeze armed", mk(mode.Enforce, config.Enforcement{Freeze: true}), action.Freeze, action.Freeze},
+		{"alert mode never acts even if keys set", mk(mode.Alert, all), action.Freeze, action.Notify},
+		{"kill is never armable", mk(mode.Enforce, all), action.Kill, action.Notify},
+		{"notify passes through", mk(mode.Alert, config.Enforcement{}), action.Notify, action.Notify},
+	}
+	for _, c := range cases {
+		if got, _ := c.app.gate(c.in); got != c.want {
+			t.Errorf("%s: gate(%s) = %s, want %s", c.name, c.in, got, c.want)
 		}
 	}
 }

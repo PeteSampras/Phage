@@ -90,3 +90,94 @@ func TestDefaultIsValid(t *testing.T) {
 		t.Fatalf("Default() must validate: %v", err)
 	}
 }
+
+func TestDefaultArmsNothing(t *testing.T) {
+	// The default posture is learn → alert: no acting feature is on, and even in
+	// enforce mode an untouched config arms nothing.
+	d := Default()
+	if got := d.Enforcement.Requested(); len(got) != 0 {
+		t.Fatalf("Default() requests enforcement features %v, want none", got)
+	}
+	d.Mode = mode.Enforce
+	for _, f := range []string{FeatureIsolate, FeatureFreeze, FeatureSelfHeal, FeatureSelfProtect, FeatureHoneytokens} {
+		if d.Armed(f) {
+			t.Errorf("enforce mode with default enforcement block arms %s", f)
+		}
+	}
+}
+
+func TestLoadEnforcementBlock(t *testing.T) {
+	p := writeTemp(t, `
+mode: enforce
+release_after: 120
+enforcement:
+  isolate: true
+  freeze: false
+  self_heal: true
+  self_protect: true
+  honeytokens: true
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Enforcement{Isolate: true, SelfHeal: true, SelfProtect: true, Honeytokens: true}
+	if cfg.Enforcement != want {
+		t.Errorf("Enforcement = %+v, want %+v", cfg.Enforcement, want)
+	}
+	if cfg.ReleaseAfter != 120 {
+		t.Errorf("ReleaseAfter = %d, want 120", cfg.ReleaseAfter)
+	}
+	if !cfg.Armed(FeatureIsolate) || cfg.Armed(FeatureFreeze) || !cfg.Armed(FeatureSelfHeal) {
+		t.Errorf("Armed() does not follow the enforcement keys: %+v", cfg.Enforcement)
+	}
+}
+
+func TestLoadRefusesActingFeatureOutsideEnforce(t *testing.T) {
+	// Fail closed: an acting feature switched on in learn or alert mode is a
+	// startup error, never silently honoured (upstream ran self-heal in alert).
+	for _, m := range []string{"learn", "alert"} {
+		for _, key := range []string{"isolate", "freeze", "self_heal", "self_protect", "honeytokens"} {
+			p := writeTemp(t, "mode: "+m+"\nenforcement:\n  "+key+": true\n")
+			if _, err := Load(p); err == nil {
+				t.Errorf("mode %s with enforcement.%s: true loaded; want an error", m, key)
+			}
+		}
+	}
+}
+
+func TestValidateRefusesFlagArmedOutsideEnforce(t *testing.T) {
+	// The CLI path (-heal/-protect/-honeytokens) goes through Validate too.
+	c := Default()
+	c.Mode = mode.Alert
+	c.Enforcement.SelfHeal = true
+	if err := c.Validate(); err == nil {
+		t.Fatal("alert mode with self-heal on must not validate")
+	}
+	c.Mode = mode.Enforce
+	if err := c.Validate(); err != nil {
+		t.Fatalf("enforce mode with self-heal on should validate: %v", err)
+	}
+}
+
+func TestArmedNeverOutsideEnforce(t *testing.T) {
+	// Defence in depth: even a config that bypassed Validate cannot arm anything
+	// unless the mode is enforce.
+	c := Default()
+	c.Enforcement = Enforcement{Isolate: true, Freeze: true, SelfHeal: true, SelfProtect: true, Honeytokens: true}
+	for _, m := range []mode.Mode{mode.Learn, mode.Alert} {
+		c.Mode = m
+		for _, f := range c.Enforcement.Requested() {
+			if c.Armed(f) {
+				t.Errorf("mode %s arms %s", m, f)
+			}
+		}
+	}
+}
+
+func TestLoadRejectsNegativeReleaseAfter(t *testing.T) {
+	p := writeTemp(t, "release_after: -5\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected error for a negative release_after")
+	}
+}

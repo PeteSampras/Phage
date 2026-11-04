@@ -131,8 +131,13 @@ func (a *App) Run(ctx context.Context) error {
 	go a.deadMansSwitch(ctx)
 	go a.releaseLoop(ctx)
 
-	// Opt-in honeytokens: plant decoy credential files and alert on any read.
-	if a.cfg.Honeytokens {
+	// Acting features. Each arms only when mode is enforce AND its own
+	// `enforcement:` key is on (config.Armed); config.Validate already refused
+	// any other combination at startup, and Armed re-checks the mode here so a
+	// config that skipped Validate still cannot arm anything outside enforce.
+
+	// Honeytokens: plant decoy credential files and alert on any read.
+	if a.cfg.Armed(config.FeatureHoneytokens) {
 		paths, inodes := honeytoken.Seed()
 		if len(inodes) == 0 {
 			log.Printf("honeytokens: none planted (decoy paths already exist?)")
@@ -144,11 +149,11 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	// Opt-in tamper-resistance: deny signals that would kill the agent. Loaded as
-	// a separate eBPF-LSM object so a kernel without BPF LSM still runs the agent.
-	if a.cfg.Protect {
+	// Tamper-resistance: deny signals that would kill the agent. Loaded as a
+	// separate eBPF-LSM object so a kernel without BPF LSM still runs the agent.
+	if a.cfg.Armed(config.FeatureSelfProtect) {
 		if !selfprotect.Available() {
-			log.Printf("self-protection requested (-protect) but BPF LSM is not active; running without it")
+			log.Printf("self-protection requested (enforcement.self_protect) but BPF LSM is not active; running without it")
 		} else {
 			objPath := filepath.Join(filepath.Dir(a.objPath), "selfprotect.bpf.o")
 			g, err := selfprotect.Arm(objPath, uint32(os.Getpid()), uint32(os.Getppid()))
@@ -161,25 +166,29 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	// In enforce mode, load per-process network quarantine (the reversible
-	// isolate rung used for egress/C2 verdicts). Optional: if it can't load, the
-	// agent falls back to freeze.
-	if a.cfg.Mode == mode.Enforce {
+	// Per-process network quarantine (the reversible isolate rung used for
+	// egress/C2 verdicts). Optional: if it can't load, egress verdicts fall back
+	// to freeze — but only if freeze is armed too; otherwise they alert.
+	if a.cfg.Armed(config.FeatureIsolate) {
 		nqObj := filepath.Join(filepath.Dir(a.objPath), "netquarantine.bpf.o")
 		if nq, err := netquarantine.New(nqObj); err != nil {
-			log.Printf("network quarantine unavailable: %v (egress verdicts will freeze instead)", err)
+			log.Printf("network quarantine unavailable: %v (egress verdicts will freeze if freeze is armed, else alert)", err)
 		} else {
 			a.netq = nq
 			defer nq.Close()
 		}
 	}
 
-	// Opt-in self-healing: snapshot the sentinel files now, restore them after a
-	// malicious write (enforce). Only files snapshotted here are ever healed.
-	if a.cfg.Heal {
+	// Self-healing: snapshot the sentinel files now, restore them after a
+	// malicious write. Only files snapshotted here are ever healed.
+	if a.cfg.Armed(config.FeatureSelfHeal) {
 		a.healer = selfheal.New("/var/lib/phage/quarantine")
 		n := a.healer.SnapshotAll(selfheal.DefaultSentinels())
 		log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
+	}
+
+	if a.cfg.Mode == mode.Enforce && len(a.cfg.Enforcement.Requested()) == 0 {
+		log.Printf("mode=enforce but no enforcement feature is enabled in the config: verdicts alert only")
 	}
 
 	log.Printf("sensors attached (creds, exec, egress, files, kernel-enabling ops, self-defense); mode=%s obj=%s", a.cfg.Mode, a.objPath)
@@ -309,7 +318,14 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if parent == "" && len(ev.Lineage) > 0 {
 		parent = ev.Lineage[0].Comm
 	}
+	// The matrix says what the verdict would justify; the config says what the
+	// operator has allowed. Downgrade a rung that is not armed to an alert.
+	want, gateNote := a.gate(want)
+
 	reason := reasons(v)
+	if gateNote != "" {
+		reason = fmt.Sprintf("%s [%s]", reason, gateNote)
+	}
 	// For egress anomalies, the concrete destination is the operator's first
 	// question; keep it in the reason and the audit trail even though the IP is
 	// deliberately not a learned feature.
@@ -344,11 +360,14 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 				contained = true
 				log.Printf("CONTAIN pid=%d comm=%q ISOLATED (egress severed, process alive, reversible)", ev.PID, ev.Comm)
 			}
-		} else { // no eBPF-cgroup isolation available — fall back to freeze
+		} else if a.cfg.Armed(config.FeatureFreeze) { // isolation armed but failed to load — fall back to freeze
 			want = action.Freeze
+		} else {
+			want = action.Notify
+			log.Printf("ISOLATE pid=%d unavailable (network quarantine not loaded) and freeze not armed — alert only", ev.PID)
 		}
 	}
-	if want == action.Freeze {
+	if want == action.Freeze && a.cfg.Armed(config.FeatureFreeze) {
 		if ok, why := containmentSafe(ev); !ok {
 			log.Printf("CONTAIN pid=%d comm=%q SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
 		} else if err := a.freezer.Freeze(ev.PID); err != nil {
@@ -362,7 +381,8 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	// Self-heal a malicious write to a snapshotted sentinel file. Gated on the
 	// score crossing the containment threshold (the write is judged malicious),
 	// independent of the process-containment rung above.
-	if ev.Kind == kind.FileWrite && v.Score >= a.cfg.Thresholds.Contain && a.healer != nil && a.healer.Watched(ev.File.Path) {
+	if ev.Kind == kind.FileWrite && v.Score >= a.cfg.Thresholds.Contain &&
+		a.cfg.Armed(config.FeatureSelfHeal) && a.healer != nil && a.healer.Watched(ev.File.Path) {
 		go a.selfHeal(ev.File.Path)
 	}
 
@@ -385,6 +405,28 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		a.recent = a.recent[len(a.recent)-a.recentLimit:]
 	}
 	a.mu.Unlock()
+}
+
+// gate maps the action the response matrix chose onto what the operator's
+// config allows: a containment rung whose enforcement key is off (or any rung
+// outside enforce mode) becomes Notify, with a short note for the log/audit.
+func (a *App) gate(want action.Type) (action.Type, string) {
+	switch want {
+	case action.None, action.Notify:
+		return want, ""
+	case action.Isolate:
+		if a.cfg.Armed(config.FeatureIsolate) {
+			return want, ""
+		}
+		return action.Notify, "isolate not armed: alert only"
+	case action.Freeze:
+		if a.cfg.Armed(config.FeatureFreeze) {
+			return want, ""
+		}
+		return action.Notify, "freeze not armed: alert only"
+	default: // Kill (never chosen today) or anything new: no config key allows it
+		return action.Notify, fmt.Sprintf("%s not armable: alert only", want)
+	}
 }
 
 // Status implements control.Handler.

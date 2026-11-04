@@ -25,9 +25,19 @@ only climbs when the operator is ready.
   real and the noise is low, tune `thresholds.notify`.
 
 ## enforce
-- Scores, notifies, and **contains**: at/above `thresholds.contain` it acts.
-- Default containment is **freeze** (cgroup-freeze the process tree), not kill —
-  reversible, so a mistake is recoverable. Kill/isolate are opt-in.
+- Scores, notifies, and — **only for the features the operator has switched on**
+  in the config's `enforcement:` block — **acts** at/above `thresholds.contain`.
+- In this fork every acting feature is **off by default**: `isolate` (network
+  quarantine), `freeze` (cgroup-freeze the process tree), `self_heal`,
+  `self_protect` (eBPF-LSM tamper-resistance) and `honeytokens`. With none of
+  them on, enforce behaves exactly like alert. A containment rung the matrix
+  picks but the config has not armed is downgraded to an alert (and the audit
+  reason says so). Kill is never used.
+- Each feature arms only with `mode: enforce` **and** its own key true. A key (or
+  the matching `-heal`/`-protect`/`-honeytokens` flag) set in learn or alert mode
+  is a **startup error** — phaged fails closed rather than guessing.
+- Anything that arms is announced: one `ENFORCEMENT ARMED features=...` log line
+  and an `enforcement_armed` audit record, so a SIEM can alert on it.
 
 ## Containment safety — what enforce will NEVER freeze
 Learned the hard way: an early enforce build froze the shell of an incoming SSH
@@ -39,9 +49,10 @@ in `internal/agent/app`):
 1. **Never freeze an interactive login session.** Anything with a login
    session behind it (loginuid set) is the admin path and is exempt — Phage
    alerts, never contains, there.
-2. **Never freeze the control plane.** `sshd`, `systemd`, `init`, `login`,
-   `getty`, `systemd-logind`, `dbus-daemon`, and `phaged` itself (and their
-   direct children) are never frozen.
+2. **Never freeze the control plane.** `sshd` (recognised by its executable
+   path, not its name), `systemd`, `init`, `login`, `getty`, `systemd-logind`,
+   `dbus-daemon`, and `phaged` itself (recognised by pid), and their direct
+   children, are never frozen.
 3. **Only contain an actual privilege escalation.** A generic exec-pattern
    anomaly alerts but never freezes; freezing is reserved for an unprivileged
    process that reached root with no session — the high-confidence signal.

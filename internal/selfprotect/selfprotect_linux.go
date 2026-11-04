@@ -3,7 +3,7 @@
 // Package selfprotect is the eBPF-LSM tamper-resistance layer: it denies a
 // lethal/stop signal aimed at the agent from an unauthorized sender, so an
 // attacker cannot blind Phage by killing it. It is loaded only when the operator
-// opts in (`phaged -protect`) and the kernel has BPF LSM active; everywhere else
+// opts in (`mode: enforce` + `enforcement.self_protect: true`) and the kernel has BPF LSM active; everywhere else
 // the agent runs without it rather than failing to start.
 package selfprotect
 

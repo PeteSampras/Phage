@@ -5,7 +5,7 @@
  * lsm/task_kill hook refuses a lethal/stop signal aimed at the agent from an
  * unauthorized sender, so an attacker cannot blind Phage by killing it.
  *
- * Separate object, loaded only when `phaged -protect` is set AND the kernel has
+ * Separate object, loaded only when self-protection is armed (mode enforce + enforcement.self_protect) AND the kernel has
  * BPF LSM active — so phaged still starts everywhere else.
  *
  * Safety (this project has a lockout scar): enforcement is inert unless `protect`
