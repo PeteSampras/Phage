@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Every test runs twice: once through openat2(RESOLVE_NO_SYMLINKS) and once
@@ -106,7 +108,7 @@ func TestHealRestoresContentAndMode(t *testing.T) {
 		for _, dir := range []string{f.sshDir, f.quarantine} {
 			ents, _ := os.ReadDir(dir)
 			for _, e := range ents {
-				if strings.Contains(e.Name(), "stage") || strings.Contains(e.Name(), "phage-heal") {
+				if strings.Contains(e.Name(), "phage-heal") {
 					t.Errorf("leftover staging file %s/%s", dir, e.Name())
 				}
 			}
@@ -159,7 +161,10 @@ func TestHealIgnoresPlantedTempSymlink(t *testing.T) {
 	})
 }
 
-func TestHealRefusesTargetSwappedForSymlink(t *testing.T) {
+// An attacker who swaps the sentinel for a symlink must not make root write
+// through it — but the swap must not defeat the heal either: the link itself is
+// replaced by the known-good file and its target recorded as evidence.
+func TestHealReplacesTargetSwappedForSymlink(t *testing.T) {
 	bothResolvers(t, func(t *testing.T) {
 		f := newFixture(t)
 		mustSnapshot(t, f)
@@ -170,17 +175,107 @@ func TestHealRefusesTargetSwappedForSymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := f.store.Heal(f.target)
-		if !errors.Is(err, ErrUnsafe) {
-			t.Fatalf("Heal through a symlinked target: err = %v, want ErrUnsafe", err)
+		q, err := f.store.Heal(f.target)
+		if err != nil {
+			t.Fatalf("Heal: %v", err)
 		}
 		if got := readFile(t, victim); got != "root:secret\n" {
-			t.Fatalf("victim modified: %q", got)
+			t.Fatalf("victim modified through the symlink: %q", got)
 		}
-		if fi, _ := os.Lstat(f.target); fi.Mode()&os.ModeSymlink == 0 {
-			t.Error("the symlink was replaced; a refused heal must not touch the path")
+		fi, _ := os.Lstat(f.target)
+		if !fi.Mode().IsRegular() || readFile(t, f.target) != "good\n" {
+			t.Errorf("target not restored as a regular file: mode %v", fi.Mode())
+		}
+		if q == "" || !strings.Contains(readFile(t, q), victim) {
+			t.Errorf("evidence %q should record the symlink target", q)
 		}
 	})
+}
+
+// Growing the file past the snapshot bound used to make the read fail and the
+// heal give up. The restore no longer depends on reading the tampered file.
+func TestHealRestoresOversizedTarget(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	big := strings.Repeat("A", maxSnapshot+1024)
+	writeFile(t, f.target, big, 0o640)
+	q, err := f.store.Heal(f.target)
+	if err != nil {
+		t.Fatalf("Heal: %v", err)
+	}
+	if readFile(t, f.target) != "good\n" {
+		t.Error("oversized target not restored")
+	}
+	ev := readFile(t, q)
+	if len(ev) > maxEvidence+200 || !strings.Contains(ev, "truncated") {
+		t.Errorf("evidence should be truncated with a note (len %d)", len(ev))
+	}
+}
+
+func TestHealClaimDedups(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	if !f.store.Claim(f.target) {
+		t.Fatal("first claim must succeed")
+	}
+	if f.store.Claim(f.target) {
+		t.Fatal("a second claim while one heal is pending must be refused")
+	}
+	f.store.Release(f.target)
+	if !f.store.Claim(f.target) {
+		t.Fatal("claim after release must succeed")
+	}
+}
+
+func TestQuarantineQuotaPrunesOldest(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	f.store.quotaBytes = 3000
+	var kept []string
+	for i := 0; i < 5; i++ {
+		writeFile(t, f.target, strings.Repeat("x", 1000)+string(rune('a'+i)), 0o640)
+		q, err := f.store.Heal(f.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept = append(kept, q)
+	}
+	ents, _ := os.ReadDir(f.quarantine)
+	var total int64
+	for _, e := range ents {
+		fi, _ := e.Info()
+		total += fi.Size()
+	}
+	if total > 3000 {
+		t.Errorf("quarantine holds %d bytes, over the 3000-byte quota", total)
+	}
+	if _, err := os.Stat(kept[0]); err == nil {
+		t.Error("the oldest evidence should have been pruned")
+	}
+	if _, err := os.Stat(kept[4]); err != nil {
+		t.Error("the newest evidence must be kept")
+	}
+}
+
+// The restored copy is staged beside the target (same directory), never in the
+// quarantine dir, so it takes the directory's default SELinux context; a label
+// recorded at snapshot time is re-applied best effort.
+func TestHealCopiesSELinuxLabelWhenPossible(t *testing.T) {
+	f := newFixture(t)
+	label := []byte("system_u:object_r:ssh_home_t:s0")
+	if err := unix.Setxattr(f.target, selinuxXattr, label, 0); err != nil {
+		t.Skipf("cannot set %s here (%v): no SELinux/security xattr support", selinuxXattr, err)
+	}
+	mustSnapshot(t, f)
+	writeFile(t, f.target, "evil\n", 0o640)
+	if _, err := f.store.Heal(f.target); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 256)
+	n, err := unix.Getxattr(f.target, selinuxXattr, buf)
+	if err != nil || string(buf[:n]) != string(label) {
+		t.Errorf("label after heal = %q (%v), want %q", buf[:n], err, label)
+	}
 }
 
 func TestHealRefusesParentSwappedForSymlink(t *testing.T) {
@@ -221,15 +316,28 @@ func TestHealRefusesReplacedParentDir(t *testing.T) {
 	}
 }
 
-func TestHealRefusesNonRegularTarget(t *testing.T) {
+func TestHealReplacesNonRegularTarget(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
 	os.Remove(f.target)
 	if err := syscall.Mkfifo(f.target, 0o600); err != nil {
 		t.Skipf("mkfifo unavailable: %v", err)
 	}
+	if _, err := f.store.Heal(f.target); err != nil {
+		t.Fatalf("Heal of a FIFO: %v", err)
+	}
+	if fi, _ := os.Lstat(f.target); !fi.Mode().IsRegular() {
+		t.Errorf("FIFO not replaced: %v", fi.Mode())
+	}
+}
+
+func TestHealRefusesDirectoryTarget(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	os.Remove(f.target)
+	os.Mkdir(f.target, 0o700)
 	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
-		t.Fatalf("Heal of a FIFO: err = %v, want ErrUnsafe", err)
+		t.Fatalf("Heal over a directory: err = %v, want ErrUnsafe", err)
 	}
 }
 

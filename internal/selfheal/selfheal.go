@@ -12,8 +12,10 @@
 // (openat2 RESOLVE_NO_SYMLINKS, or a component-by-component O_NOFOLLOW walk),
 // all work after that is done through file descriptors, new files are created
 // O_CREAT|O_EXCL|O_NOFOLLOW, and the parent directory must be owned by root or
-// by the file's own owner. A heal that cannot be done safely is refused, never
-// attempted. See FORK.md for the attack this closes.
+// by the file's own owner and be the directory that was snapshotted. Only the
+// snapshot side is picky about the file itself: whatever an attacker leaves at
+// the path (a huge file, a symlink, a FIFO) is never followed or read through,
+// but it IS replaced — the restore renames over it. See FORK.md.
 package selfheal
 
 import (
@@ -37,8 +39,15 @@ var ErrUnsafe = errors.New("unsafe path")
 type Store struct {
 	mu         sync.Mutex
 	good       map[string]snapshot
+	inflight   map[string]bool
 	quarantine string
+	// quotaBytes caps the evidence kept in the quarantine directory; the
+	// oldest evidence files are pruned (and logged) past it.
+	quotaBytes int64
 }
+
+// DefaultQuotaBytes caps the quarantine directory's evidence.
+const DefaultQuotaBytes = 64 << 20
 
 // snapshot is a file's known-good content plus the identity needed to restore
 // it faithfully (owner, group, permission bits) and to notice that its parent
@@ -47,6 +56,7 @@ type snapshot struct {
 	content  []byte
 	mode     os.FileMode
 	uid, gid int
+	label    []byte // security.selinux, when present (restored best effort)
 	dirDev   uint64
 	dirIno   uint64
 }
@@ -60,7 +70,8 @@ func New(quarantineDir string) (*Store, error) {
 	if err := prepareQuarantine(quarantineDir); err != nil {
 		return nil, err
 	}
-	return &Store{good: map[string]snapshot{}, quarantine: quarantineDir}, nil
+	return &Store{good: map[string]snapshot{}, inflight: map[string]bool{},
+		quarantine: quarantineDir, quotaBytes: DefaultQuotaBytes}, nil
 }
 
 // DefaultSentinels resolves the built-in high-value set that exists on this host:
@@ -134,7 +145,28 @@ func (s *Store) Heal(path string) (string, error) {
 	if !ok {
 		return "", nil
 	}
-	return heal(path, snap, s.quarantine)
+	return heal(path, snap, s.quarantine, s.quotaBytes)
+}
+
+// Claim marks a heal of path as pending and reports whether the caller got it.
+// A burst of writes to one file schedules one heal, not one per write; the
+// caller must Release when its heal is done.
+func (s *Store) Claim(path string) bool {
+	path = filepath.Clean(path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight[path] {
+		return false
+	}
+	s.inflight[path] = true
+	return true
+}
+
+// Release ends a heal claimed with Claim.
+func (s *Store) Release(path string) {
+	s.mu.Lock()
+	delete(s.inflight, filepath.Clean(path))
+	s.mu.Unlock()
 }
 
 func sanitize(p string) string {

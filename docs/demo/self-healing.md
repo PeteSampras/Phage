@@ -21,12 +21,18 @@ excluded, so it can't loop.
 Because the agent runs as root and several sentinels live in directories a
 user controls (`/home/*/.ssh`), every step is symlink-safe (this fork): paths
 are opened with `openat2(RESOLVE_NO_SYMLINKS)` (or an `O_NOFOLLOW` walk on older
-kernels), the restored copy is staged `O_CREAT|O_EXCL|O_NOFOLLOW` in the
-root-only quarantine directory and `renameat`-ed into the verified parent
-directory, the original owner/group/mode are restored with `fchown`/`fchmod`, and
-the heal is **refused** if the file or any path component is a symlink, the file
-is not a regular file, the parent directory was swapped since the snapshot, or
-the parent is owned by neither root nor the file's owner.
+kernels); the restored copy is created `O_CREAT|O_EXCL|O_NOFOLLOW` under a
+random name **beside the target, through the verified parent directory fd** (so
+it gets the directory's default SELinux context; the snapshot's
+`security.selinux` label is re-applied best effort), given the original
+owner/group/mode with `fchown`/`fchmod`, and `renameat`-ed over the target.
+Whatever the attacker left at the path — an oversized file, a symlink, a FIFO —
+is never followed or read through but is replaced; the evidence copy is
+truncated or records the symlink target. The heal is refused only if a path
+component is a symlink, the parent directory was swapped since the snapshot,
+the parent is owned by neither root nor the file's owner, or the target is now
+a directory. A burst of writes schedules one heal per file, and the quarantine
+directory is capped (64 MiB by default; oldest evidence pruned and logged).
 
 ## The run (enforce + self-heal)
 ```

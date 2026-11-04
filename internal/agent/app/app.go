@@ -441,7 +441,9 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	// independent of the process-containment rung above.
 	if ev.Kind == kind.FileWrite && v.Score >= a.cfg.Thresholds.Contain &&
 		a.cfg.Armed(config.FeatureSelfHeal) && a.healer != nil && a.healer.Watched(ev.File.Path) {
-		go a.selfHeal(ev.File.Path)
+		if a.healer.Claim(ev.File.Path) { // one pending heal per path, however many writes
+			go a.selfHeal(ev.File.Path)
+		}
 	}
 
 	if contained {
@@ -717,6 +719,7 @@ func pidAlive(pid int32) bool {
 // selfHeal restores a tampered sentinel file after letting the malicious write
 // land, keeping the attacker's version as evidence.
 func (a *App) selfHeal(path string) {
+	defer a.healer.Release(path)
 	time.Sleep(250 * time.Millisecond) // let the write complete, then revert it
 	q, err := a.healer.Heal(path)
 	if err != nil {

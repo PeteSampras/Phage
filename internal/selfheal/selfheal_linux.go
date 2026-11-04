@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -193,12 +194,80 @@ func readSnapshot(path string) (snapshot, error) {
 		mode:    os.FileMode(st.Mode & 0o777),
 		uid:     int(st.Uid),
 		gid:     int(st.Gid),
+		label:   getLabel(int(f.Fd())),
 		dirDev:  uint64(dst.Dev),
 		dirIno:  dst.Ino,
 	}, nil
 }
 
-func heal(path string, snap snapshot, quarantine string) (string, error) {
+const selinuxXattr = "security.selinux"
+
+// getLabel returns the file's SELinux label, or nil when there is none (no
+// SELinux, or a filesystem without xattrs).
+func getLabel(fd int) []byte {
+	buf := make([]byte, 256)
+	for {
+		n, err := unix.Fgetxattr(fd, selinuxXattr, buf)
+		if err == unix.ERANGE && len(buf) < 4096 {
+			buf = make([]byte, len(buf)*4)
+			continue
+		}
+		if err != nil || n == 0 {
+			return nil
+		}
+		return buf[:n]
+	}
+}
+
+// maxEvidence bounds one evidence file; a bigger tampered file is kept
+// truncated (the restore does not depend on reading it).
+const maxEvidence = maxSnapshot
+
+// currentEvidence inspects whatever now sits at path WITHOUT following it and
+// returns (evidence bytes, unchanged-from-snapshot). Anything an attacker can
+// put there — a huge file, a symlink, a FIFO, a device — yields evidence and a
+// restore; only a directory (which a rename cannot replace) is an error.
+func currentEvidence(dirfd int, path string, snap snapshot) ([]byte, bool, error) {
+	base := filepath.Base(path)
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirfd, base, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err == unix.ENOENT {
+			return nil, false, nil // deleted: restore it
+		}
+		return nil, false, err
+	}
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFREG:
+		f, fst, err := openRegular(dirfd, path)
+		if err != nil {
+			// Swapped between the fstatat and the open: note it, still restore.
+			return []byte(fmt.Sprintf("phage: could not read tampered file: %v\n", err)), false, nil
+		}
+		defer f.Close()
+		data, err := io.ReadAll(io.LimitReader(f, maxEvidence+1))
+		if err != nil {
+			return []byte(fmt.Sprintf("phage: read error: %v\n", err)), false, nil
+		}
+		if len(data) > maxEvidence {
+			note := fmt.Sprintf("\nphage: evidence truncated at %d of %d bytes\n", maxEvidence, fst.Size)
+			return append(data[:maxEvidence], note...), false, nil
+		}
+		return data, bytes.Equal(data, snap.content), nil
+	case unix.S_IFLNK:
+		buf := make([]byte, unix.PathMax)
+		n, err := unix.Readlinkat(dirfd, base, buf)
+		if err != nil {
+			return []byte(fmt.Sprintf("phage: target was a symlink (readlink: %v)\n", err)), false, nil
+		}
+		return []byte(fmt.Sprintf("phage: target was a symlink -> %q\n", buf[:n])), false, nil
+	case unix.S_IFDIR:
+		return nil, false, fmt.Errorf("%w: %q is now a directory; cannot restore over it", ErrUnsafe, path)
+	default:
+		return []byte(fmt.Sprintf("phage: target was a non-regular file (mode %#o)\n", st.Mode)), false, nil
+	}
+}
+
+func heal(path string, snap snapshot, quarantine string, quota int64) (string, error) {
 	dirfd, dst, err := openParent(path)
 	if err != nil {
 		return "", fmt.Errorf("open parent: %w", err)
@@ -212,74 +281,113 @@ func heal(path string, snap snapshot, quarantine string) (string, error) {
 			ErrUnsafe, path, dst.Uid, snap.uid)
 	}
 
-	// Current (tampered) content. A deleted file is restored; a file swapped for
-	// a symlink or anything non-regular is refused (we never act through it).
-	var cur []byte
-	if f, _, err := openRegular(dirfd, path); err == nil {
-		cur, err = readBounded(f)
-		f.Close()
-		if err != nil {
-			return "", err
-		}
-	} else if err != unix.ENOENT {
-		return "", err
-	}
-	if bytes.Equal(cur, snap.content) {
-		return "", nil // unchanged from known-good; the write was benign/identical
-	}
-
-	qfd, err := openNoSymlinks(quarantine, unix.O_RDONLY|unix.O_DIRECTORY)
+	evidence, unchanged, err := currentEvidence(dirfd, path, snap)
 	if err != nil {
-		return "", fmt.Errorf("quarantine dir: %w", err)
-	}
-	defer unix.Close(qfd)
-	if err := vetQuarantineFd(quarantine, qfd); err != nil {
 		return "", err
 	}
-
-	// Evidence first. Failing to keep it must not stop the restore.
-	var qpath string
-	if len(cur) > 0 {
-		name := fmt.Sprintf("%d-%s", time.Now().Unix(), sanitize(path))
-		if n, err := writeExcl(qfd, name, cur, os.Getuid(), os.Getgid(), 0o600); err != nil {
-			log.Printf("self-heal %q: evidence not saved: %v", path, err)
-		} else {
-			qpath = filepath.Join(quarantine, n)
-		}
+	if unchanged {
+		return "", nil // identical to known-good; the write was benign/identical
 	}
 
-	// Stage the restored content in the root-only quarantine dir and rename it
-	// into place. If the target lives on another filesystem (EXDEV), stage next
-	// to it instead — still O_EXCL|O_NOFOLLOW under a random name, so a
-	// pre-planted file or symlink can only make the create fail, never redirect it.
+	// Evidence first, in the root-only quarantine dir. Failing to keep it must
+	// not stop the restore.
+	var qpath string
+	if len(evidence) > 0 {
+		qpath = saveEvidence(quarantine, path, evidence, quota)
+	}
+
+	// Stage the restored copy NEXT TO the target, through the verified parent
+	// fd: same filesystem (rename is atomic), and the new inode gets the
+	// directory's default SELinux label like any file created there. O_EXCL|
+	// O_NOFOLLOW under a random name, so a pre-planted file or symlink can only
+	// make the create fail, never redirect it. renameat replaces whatever is at
+	// the target name (file, symlink, FIFO) without following it.
 	base := filepath.Base(path)
-	tmp, err := writeExcl(qfd, ".stage-"+base, snap.content, snap.uid, snap.gid, snap.mode)
+	tmp, err := writeExcl(dirfd, ".phage-heal-"+base, snap.content, snap.uid, snap.gid, snap.mode, snap.label)
 	if err != nil {
 		return qpath, fmt.Errorf("stage restored content: %w", err)
 	}
-	err = unix.Renameat(qfd, tmp, dirfd, base)
-	if err == unix.EXDEV {
-		unix.Unlinkat(qfd, tmp, 0)
-		tmp, err = writeExcl(dirfd, ".phage-heal-"+base, snap.content, snap.uid, snap.gid, snap.mode)
-		if err != nil {
-			return qpath, fmt.Errorf("stage restored content: %w", err)
-		}
-		if err = unix.Renameat(dirfd, tmp, dirfd, base); err != nil {
-			unix.Unlinkat(dirfd, tmp, 0)
-		}
-	} else if err != nil {
-		unix.Unlinkat(qfd, tmp, 0)
-	}
-	if err != nil {
+	if err := unix.Renameat(dirfd, tmp, dirfd, base); err != nil {
+		unix.Unlinkat(dirfd, tmp, 0)
 		return qpath, fmt.Errorf("atomic restore: %w", err)
 	}
 	return qpath, nil
 }
 
+// saveEvidence writes one evidence file into the quarantine dir and prunes the
+// oldest evidence past quota. It returns the evidence path, or "" (logged) if
+// it could not be kept.
+func saveEvidence(quarantine, path string, evidence []byte, quota int64) string {
+	qfd, err := openNoSymlinks(quarantine, unix.O_RDONLY|unix.O_DIRECTORY)
+	if err == nil {
+		err = vetQuarantineFd(quarantine, qfd)
+		if err != nil {
+			unix.Close(qfd)
+		}
+	}
+	if err != nil {
+		log.Printf("self-heal %q: evidence not saved: quarantine dir: %v", path, err)
+		return ""
+	}
+	defer unix.Close(qfd)
+	// Zero-padded nanoseconds first, so name order is age order for pruning.
+	name := fmt.Sprintf("%020d-%s", time.Now().UnixNano(), sanitize(path))
+	n, err := writeExcl(qfd, name, evidence, os.Getuid(), os.Getgid(), 0o600, nil)
+	if err != nil {
+		log.Printf("self-heal %q: evidence not saved: %v", path, err)
+		return ""
+	}
+	pruneQuarantine(quarantine, qfd, quota, n)
+	return filepath.Join(quarantine, n)
+}
+
+// pruneQuarantine deletes the oldest evidence files until the directory holds
+// at most quota bytes, never deleting keep (the file just written).
+func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
+	dup, err := unix.Dup(qfd)
+	if err != nil {
+		return
+	}
+	d := os.NewFile(uintptr(dup), quarantine)
+	names, err := d.Readdirnames(-1)
+	d.Close()
+	if err != nil {
+		return
+	}
+	sort.Strings(names)
+	type ent struct {
+		name string
+		size int64
+	}
+	var ents []ent
+	var total int64
+	for _, n := range names {
+		var st unix.Stat_t
+		if unix.Fstatat(qfd, n, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+			continue
+		}
+		ents = append(ents, ent{n, st.Size})
+		total += st.Size
+	}
+	for _, e := range ents {
+		if total <= quota {
+			return
+		}
+		if e.name == keep {
+			continue
+		}
+		if err := unix.Unlinkat(qfd, e.name, 0); err == nil {
+			total -= e.size
+			log.Printf("self-heal: quarantine over %d bytes: pruned oldest evidence %q (%d bytes)", quota, e.name, e.size)
+		}
+	}
+}
+
 // writeExcl creates a new file in dirfd (never an existing one, never through a
-// symlink), sets owner then mode on the descriptor, writes data and fsyncs. It
-// returns the name actually created (a random suffix is appended).
-func writeExcl(dirfd int, prefix string, data []byte, uid, gid int, mode os.FileMode) (string, error) {
+// symlink), sets owner, mode and (if given, best effort) SELinux label on the
+// descriptor, writes data and fsyncs. It returns the name actually created (a
+// random suffix is appended).
+func writeExcl(dirfd int, prefix string, data []byte, uid, gid int, mode os.FileMode, label []byte) (string, error) {
 	var rnd [8]byte
 	if _, err := rand.Read(rnd[:]); err != nil {
 		return "", err
@@ -301,6 +409,11 @@ func writeExcl(dirfd int, prefix string, data []byte, uid, gid int, mode os.File
 	}
 	if err := f.Chmod(mode); err != nil {
 		return fail(fmt.Errorf("fchmod: %w", err))
+	}
+	if len(label) > 0 {
+		if err := unix.Fsetxattr(fd, selinuxXattr, label, 0); err != nil {
+			log.Printf("self-heal: could not restore SELinux label %q on %s: %v (keeping the directory default)", label, prefix, err)
+		}
 	}
 	if _, err := f.Write(data); err != nil {
 		return fail(err)
