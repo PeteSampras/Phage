@@ -62,7 +62,7 @@ homelab-next's `novelty_finding` table:
 | `status` | `finding`, `unlearned` or `burst` (below) |
 | `score`, `confidence` | findings only: the **verdict's** score (Phage's weighted scorer, not the lake's surprise x confidence), and the confidence of its top reason |
 | `support`, `entity_total` | the top reason's feature: **raw** counts (times the value was learned, observations of the feature), not the lake's decayed support |
-| `count` | 1 (one row per event); on a `burst` row, the new rows seen in the bucket when the cap was passed |
+| `count` | 1 (one row per event); on a `burst` row, always the cap + 1 (never the true total, which the heartbeat's `novelty_over_cap` carries) |
 | `time`, `as_of` | `time` is when the kernel saw the event (back-dated by the measured lag), not the start of a scoring window as for the lake analyzer; `as_of` is when the row was written |
 | `uid` | `phage-` + a digest of source, profile, status, entity kind, entity, value and the start of the event's `output.novelty_bucket` (default 1h). The lake keys on (source, uid), so a repeat in the same bucket, including one re-sent after a restart, is one row there |
 | `message`, `reasons` | the explanation, each reason with its arithmetic, and `baseline sha256:<hex>` |
@@ -86,16 +86,25 @@ The schema is copied into `internal/novelty/testdata` (homelab-next
   (default 5000; each learned event adds one per feature it carries) its
   state is `warming` (`no_baseline` when empty): scoring continues (it is
   discounted on thin features anyway) but nothing is reported as unlearned.
+  The threshold is host-wide, not per feature class: a host whose baseline is
+  ready overall still reports a class it never saw as unlearned (that is the
+  point), and the per-feature confidence ramp in the scorer handles classes
+  that are merely thin.
   The state is logged loudly at startup (`BASELINE NOT READY`), and carried
   in the `startup` and `heartbeat` records (`baseline_state`) and in
   `phage status`.
-- **Per-bucket cap.** At most `output.novelty_max_per_bucket` (default 20)
-  new rows per profile and entity in one uid bucket. The next one is
-  replaced by a single `burst` row (no value, no score, `count` = the rows so
-  far; a signal in the schema) and the rest are only counted
-  (`novelty_over_cap` in the heartbeat). A scan, a flood of new
-  destinations, or an attacker generating noise costs a few rows per hour,
-  not one per event.
+- **Per-bucket cap.** `unlearned` rows and `finding` rows each have their own
+  budget of `output.novelty_max_per_bucket` (default 20) new rows per
+  profile and entity in one uid bucket, so a flood of one never hides the
+  other. Findings scoring at or above `thresholds.contain` are never capped.
+  The first row past a budget is replaced by a single `burst` row (no value,
+  no score; a signal in the schema), one per status, profile, entity and
+  bucket, and phaged logs one `NOVELTY BURST` line; the rest are only counted.
+  **A burst row's `count` is always the cap + 1**, not the total: the total is
+  not known when the row is written, and is the heartbeat's
+  `novelty_over_cap`. A scan, a flood of new destinations, or an attacker
+  generating noise costs a few rows per hour, not one per event, and cannot
+  push a high-scoring finding out.
 - **Writing once.** phaged remembers a uid for two buckets and writes it once
   in that time ("a repeat within one bucket" above); the dedupe set holds at
   most 65536 uids and is swept for expired ones at most once a minute. Past
@@ -300,8 +309,12 @@ toolchain to be exactly the version `go.mod` pins. It runs with
 `GOTOOLCHAIN=local`; `GOTOOLCHAIN=go<that version>` is also accepted, and go
 then fetches exactly that toolchain, checksum-verified. Whatever the caller's
 environment or go env file says, it builds with `GOENV=off`,
-`GOPROXY=https://proxy.golang.org`, `GOSUMDB=sum.golang.org`, and no
-`GONOSUMDB`/`GONOSUMCHECK`/`GONOPROXY`/`GOPRIVATE`/`GOINSECURE`. It regenerates
+`GOWORK=off`, `GOPROXY=https://proxy.golang.org`, `GOSUMDB=sum.golang.org`,
+and no `GONOSUMDB`/`GONOPROXY`/`GOPRIVATE`/`GOINSECURE`, and fails if any
+binary embeds a module replacement (`=>` in `go version -m`). clang and
+llvm-strip are resolved once, passed to `make bpf` explicitly and recorded
+with their paths in `BUILDINFO`; the Makefile deletes a target whose recipe
+failed (`.DELETE_ON_ERROR`). It regenerates
 `vmlinux.h` from the build host's kernel BTF (`BPFTOOL=` names a versioned
 bpftool), rebuilds every eBPF object, and builds `phaged`, `phage` and
 `phage-jail` with `CGO_ENABLED=0 -trimpath -buildvcs=true` and an empty build

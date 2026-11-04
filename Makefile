@@ -33,6 +33,9 @@ BPF_ARCH  := $(if $(filter x86_64,$(UNAME_M)),x86,$(if $(filter aarch64,$(UNAME_
 BPF_SRCS  := $(wildcard bpf/programs/*.bpf.c)
 BPF_OBJS  := $(patsubst bpf/programs/%.bpf.c,bpf/build/%.bpf.o,$(BPF_SRCS))
 
+# A recipe that fails (a strip, a compile) leaves no half-written target behind.
+.DELETE_ON_ERROR:
+
 .PHONY: all build daemon cli jail test lint tidy clean bpf gen-vmlinux install uninstall dist release help
 
 all: build ## Build everything (Go only)

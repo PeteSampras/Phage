@@ -21,9 +21,13 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 die() { echo "release: $*" >&2; exit 1; }
 
-for tool in go git clang llvm-strip sha256sum; do
+for tool in go git sha256sum; do
 	command -v "$tool" >/dev/null 2>&1 || die "missing $tool"
 done
+# The eBPF toolchain, resolved once and passed to make explicitly, so what
+# BUILDINFO records is what built the objects.
+CLANG=$(command -v "${CLANG:-clang}") || die "missing clang"
+LLVM_STRIP=$(command -v "${LLVM_STRIP:-llvm-strip}") || die "missing llvm-strip"
 [[ "$(uname -s)" == Linux ]] || die "the eBPF objects build on Linux only"
 
 # --- the pinned Go version -------------------------------------------------
@@ -41,8 +45,8 @@ fi
 # Nothing from the caller's environment or go env file may weaken how a
 # toolchain or module is fetched and verified: the public proxy, verified
 # against the public checksum database, nothing exempt.
-export GOENV=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOFLAGS=
-unset GONOSUMDB GONOSUMCHECK GONOPROXY GOPRIVATE GOINSECURE
+export GOENV=off GOWORK=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOFLAGS=
+unset GONOSUMDB GONOPROXY GOPRIVATE GOINSECURE
 [[ "$(go env GOSUMDB)" == sum.golang.org ]] || die "GOSUMDB is not sum.golang.org"
 have=$(go env GOVERSION)
 [[ "$have" == "go$want" ]] || die "go.mod pins go$want but the local toolchain is $have; install go$want, or run with GOTOOLCHAIN=go$want"
@@ -61,7 +65,7 @@ mkdir -p "$out/bpf"
 # --- eBPF objects ------------------------------------------------------------
 ./scripts/gen/vmlinux.sh
 rm -f bpf/build/*.bpf.o
-make --no-print-directory bpf
+make --no-print-directory bpf CLANG="$CLANG" LLVM_STRIP="$LLVM_STRIP"
 cp bpf/build/*.bpf.o "$out/bpf/"
 
 # --- Go binaries -------------------------------------------------------------
@@ -80,6 +84,11 @@ grep -q -- "-trimpath=true" <<<"$info" || die "phaged was not built with -trimpa
 if [[ "${ALLOW_DIRTY:-}" != 1 ]]; then
 	grep -q "vcs.modified=false" <<<"$info" || die "phaged embeds vcs.modified=true"
 fi
+for cmd in phaged phage phage-jail; do
+	if go version -m "$out/$cmd" | grep -q '=>'; then
+		die "$cmd was built with a module replacement (=>); releases use go.mod's modules only"
+	fi
+done
 
 # --- the rest of the install set and provenance ------------------------------
 cp deploy/phage.service configs/phage.example.yaml LICENSE deploy/wazuh/phage-heartbeat-check "$out/"
@@ -87,8 +96,8 @@ cp deploy/phage.service configs/phage.example.yaml LICENSE deploy/wazuh/phage-he
 	echo "version $version"
 	echo "commit $commit"
 	echo "go $(go env GOVERSION) GOOS=$(go env GOOS) GOARCH=$(go env GOARCH) CGO_ENABLED=0 -trimpath -buildvcs=true"
-	echo "clang $(clang --version | head -n1)"
-	echo "llvm-strip $(llvm-strip --version | grep -m1 -i version)"
+	echo "clang $CLANG: $("$CLANG" --version | head -n1)"
+	echo "llvm-strip $LLVM_STRIP: $("$LLVM_STRIP" --version | grep -m1 -i version)"
 	echo "bpftool $("${BPFTOOL:-bpftool}" version 2>/dev/null | head -n1)"
 	echo "vmlinux.h sha256 $(sha256sum bpf/include/vmlinux/vmlinux.h | cut -d' ' -f1) from kernel $(uname -r)"
 } >"$out/BUILDINFO"
