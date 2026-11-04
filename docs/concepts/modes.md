@@ -46,7 +46,7 @@ only climbs when the operator is ready.
   `ENFORCEMENT ARMED ...` log line and an `enforcement_armed` record, so a SIEM
   can alert on it. Host-modifying features require `audit_path`.
 
-## Containment safety — what enforce will NEVER freeze
+## Containment safety — what enforce will NEVER freeze or isolate
 Learned the hard way: an early enforce build froze the shell of an incoming SSH
 login (a program combination its baseline had never seen) and locked the server
 out. Autonomy must never be able to wedge the machine or lock out the operator,
@@ -56,10 +56,15 @@ in `internal/agent/app`):
 1. **Never freeze an interactive login session.** Anything with a login
    session behind it (loginuid set) is the admin path and is exempt — Phage
    alerts, never contains, there.
-2. **Never freeze the control plane.** `sshd` (recognised by its executable
-   path, not its name), `systemd`, `init`, `login`, `getty`, `systemd-logind`,
-   `dbus-daemon`, and `phaged` itself (recognised by pid), and their direct
-   children, are never frozen.
+2. **Never contain the control plane** (neither freeze nor isolate). `sshd`,
+   `systemd`, `init`, `login`, `getty`, `systemd-logind`, `dbus-daemon`, and
+   `phaged` itself, and their direct children, are never contained. In this
+   fork the agent is recognised by its pid, and sshd by identity: the inode of
+   `/proc/<pid>/exe` must be one of the host's installed sshd binaries
+   (resolved at startup), and its sshd ancestry must lead to a root sshd whose
+   parent is pid 1. A process merely *named* `sshd*` that fails that check is
+   still never contained (a false negative would be a lockout) but is logged as
+   `UNVERIFIED` so the evasion is visible.
 3. **Only contain an actual privilege escalation.** A generic exec-pattern
    anomaly alerts but never freezes; freezing is reserved for an unprivileged
    process that reached root with no session — the high-confidence signal.

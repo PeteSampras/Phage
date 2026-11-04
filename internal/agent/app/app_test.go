@@ -24,86 +24,146 @@ import (
 // a freeze is decided by the graduated-response matrix (see internal/policy/
 // response), not here.
 const (
-	selfPID         int32 = 4000
-	sshdPID         int32 = 700
-	sshdSessionPID  int32 = 701
-	upgradedSSHDPID int32 = 702
-	fakeSSHDPID     int32 = 666
-	fakePhagedPID   int32 = 667
+	selfPID       int32 = 4000
+	fakePhagedPID int32 = 667
 )
 
-// fakeExe stands in for /proc/<pid>/exe.
-func fakeExe(pid int32) string {
-	switch pid {
-	case sshdPID:
-		return "/usr/sbin/sshd"
-	case sshdSessionPID:
-		return "/usr/lib/openssh/sshd-session"
-	case upgradedSSHDPID:
-		return "/usr/sbin/sshd (deleted)"
-	case fakeSSHDPID:
-		return "/tmp/.x/sshd"
-	case fakePhagedPID:
-		return "/dev/shm/phaged"
+// fakeProc is a scripted /proc.
+type fakeProc struct {
+	procs map[int32]fakeP
+}
+
+type fakeP struct {
+	id    fileID
+	nlink uint64
+	link  string
+	ppid  int32
+	uid   int
+	ns    string
+}
+
+func (f fakeProc) get(pid int32) (fakeP, error) {
+	p, ok := f.procs[pid]
+	if !ok {
+		return fakeP{}, os.ErrNotExist
 	}
-	return "/usr/bin/bash"
+	return p, nil
+}
+func (f fakeProc) ExeID(pid int32) (fileID, uint64, string, error) {
+	p, err := f.get(pid)
+	return p.id, p.nlink, p.link, err
+}
+func (f fakeProc) PPID(pid int32) (int32, error) { p, err := f.get(pid); return p.ppid, err }
+func (f fakeProc) UID(pid int32) (int, error)    { p, err := f.get(pid); return p.uid, err }
+func (f fakeProc) MntNS(pid int32) (string, error) {
+	p, err := f.get(pid)
+	return p.ns, err
+}
+
+var (
+	sshdInode    = fileID{1, 100}
+	sessionInode = fileID{1, 101}
+	bashInode    = fileID{1, 7}
+)
+
+// A host with a real sshd tree, an upgraded (deleted-binary) sshd, and several
+// impostors.
+var testProc = fakeProc{procs: map[int32]fakeP{
+	1:    {id: fileID{1, 1}, link: "/usr/lib/systemd/systemd", uid: 0, ns: "mnt:[1]"},
+	700:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 0, ns: "mnt:[1]"},         // listener
+	710:  {id: sessionInode, nlink: 1, link: "/usr/lib/openssh/sshd-session", ppid: 700, uid: 0},    // [priv]
+	711:  {id: sessionInode, nlink: 1, link: "/usr/lib/openssh/sshd-session", ppid: 710, uid: 1000}, // [user]
+	500:  {id: bashInode, nlink: 1, link: "/usr/bin/bash", ppid: 711, uid: 1000, ns: "mnt:[1]"},     // login shell
+	702:  {id: fileID{1, 999}, nlink: 0, link: "/usr/sbin/sshd (deleted)", ppid: 1, uid: 0},         // pre-upgrade sshd
+	666:  {id: fileID{1, 555}, nlink: 1, link: "/tmp/.x/sshd", ppid: 1, uid: 0},                     // payload named sshd
+	720:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 4321, uid: 0},                     // real binary, started by a shell
+	4321: {id: bashInode, nlink: 1, link: "/usr/bin/bash", ppid: 1, uid: 0},
+	730:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 1000},                   // started by init but not root
+	667:  {id: fileID{1, 556}, nlink: 1, link: "/dev/shm/phaged", ppid: 1, uid: 0, ns: "mnt:[1]"}, // payload named phaged
+	800:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, ns: "mnt:[1]"},                          // host writer
+	801:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, ns: "mnt:[4026532999]"},                 // container writer
+}}
+
+func testSSHD() *sshdIdentity {
+	ids := map[string]fileID{"/usr/sbin/sshd": sshdInode, "/usr/lib/openssh/sshd-session": sessionInode}
+	s := &sshdIdentity{paths: sshdExes, stat: func(p string) (fileID, error) {
+		if id, ok := ids[p]; ok {
+			return id, nil
+		}
+		return fileID{}, os.ErrNotExist
+	}}
+	s.refresh()
+	return s
+}
+
+func TestSSHDIdentityByInodeAndAncestry(t *testing.T) {
+	s := testSSHD()
+	for pid, want := range map[int32]bool{
+		700: true,  // listener: sshd inode, parent init, root
+		711: true,  // user session: chain 711 -> 710 -> 700 -> init
+		702: true,  // binary replaced by an upgrade: unlinked listed path
+		666: false, // named sshd, other inode
+		720: false, // real binary, but not started by init
+		730: false, // started by init, but not root
+		500: false, // the shell itself is not sshd
+	} {
+		if got := s.verified(testProc, pid); got != want {
+			t.Errorf("verified(%d) = %v, want %v", pid, got, want)
+		}
+	}
 }
 
 func TestContainmentSafe(t *testing.T) {
-	// A genuine no-session escalation: unprivileged uid now holds root euid,
-	// no login behind it, ordinary service process.
-	escalation := model.Event{
-		Comm: "rootshell", ParentComm: "sh",
-		Creds:   model.Credentials{UID: 999, EUID: 0},
-		Session: model.Session{Interactive: false, LoginUID: -1},
-	}
-	if ok, _ := containmentSafe(escalation, selfPID, fakeExe); !ok {
-		t.Error("a no-session root escalation should be containable")
-	}
-
-	// Freeze-worthy non-escalation events (the matrix only routes high-confidence
-	// kinds here) on an ordinary service process are now containable too.
-	tamper := model.Event{
-		Comm: "bash", ParentComm: "bash",
-		Creds:   model.Credentials{UID: 0, EUID: 0},
-		Session: model.Session{Interactive: false, LoginUID: -1},
-	}
-	if ok, _ := containmentSafe(tamper, selfPID, fakeExe); !ok {
-		t.Error("a non-interactive, non-control-plane process should be containable")
-	}
-
-	// The hard guardrails: never the admin's own session, never the control plane.
-	cases := []struct {
+	sshd := testSSHD()
+	containable := []struct {
 		name string
 		ev   model.Event
 	}{
-		{"interactive admin path", model.Event{
-			Comm: "rootshell", Creds: model.Credentials{UID: 1000, EUID: 0},
-			Session: model.Session{Interactive: true, LoginUID: 1000},
-		}},
-		{"sshd child (control plane)", model.Event{
-			PID: 500, PPID: sshdPID, Comm: "bash", ParentComm: "sshd", Creds: model.Credentials{UID: 1000, EUID: 0},
-		}},
-		{"sshd itself, by exe", model.Event{
-			PID: sshdPID, Comm: "sshd", Creds: model.Credentials{UID: 0, EUID: 0},
-		}},
-		{"sshd-session (OpenSSH >= 9.8) child", model.Event{
-			PID: 501, PPID: sshdSessionPID, Comm: "bash", ParentComm: "sshd-session",
-		}},
-		{"sshd after a package upgrade (deleted binary)", model.Event{
-			PID: upgradedSSHDPID, Comm: "sshd",
-		}},
-		{"the agent itself, by pid", model.Event{
-			PID: selfPID, Comm: "anything",
-		}},
-		{"systemd itself", model.Event{
-			Comm: "systemd", Creds: model.Credentials{UID: 0, EUID: 0},
-		}},
+		{"no-session root escalation", model.Event{PID: 900, PPID: 4321, Comm: "rootshell", ParentComm: "bash",
+			Creds: model.Credentials{UID: 999, EUID: 0}, Session: model.Session{LoginUID: -1}}},
+		{"payload named phaged", model.Event{PID: fakePhagedPID, Comm: "phaged", PPID: 1, ParentComm: "systemd-x"}},
+		{"child of a fake phaged", model.Event{PID: 901, PPID: fakePhagedPID, Comm: "sh", ParentComm: "phaged"}},
+		{"real sshd binary run by a user shell, renamed", model.Event{PID: 720, PPID: 4321, Comm: "x", ParentComm: "bash"}},
 	}
-	for _, c := range cases {
-		if ok, _ := containmentSafe(c.ev, selfPID, fakeExe); ok {
+	for _, c := range containable {
+		if ok, why := containmentSafe(c.ev, selfPID, testProc, sshd); !ok {
+			t.Errorf("%s: should be containable, got skipped (%s)", c.name, why)
+		}
+	}
+	never := []struct {
+		name string
+		ev   model.Event
+	}{
+		{"interactive admin path", model.Event{PID: 902, Session: model.Session{Interactive: true, LoginUID: 1000}}},
+		{"the agent itself, by pid", model.Event{PID: selfPID, Comm: "anything"}},
+		{"child of the agent", model.Event{PID: 903, PPID: selfPID, Comm: "anything"}},
+		{"verified sshd listener", model.Event{PID: 700, PPID: 1, Comm: "sshd"}},
+		{"shell under a verified sshd session", model.Event{PID: 500, PPID: 711, Comm: "bash", ParentComm: "sshd-session"}},
+		{"upgraded (deleted-binary) sshd", model.Event{PID: 702, PPID: 1, Comm: "sshd"}},
+		{"systemd by name", model.Event{PID: 904, Comm: "systemd"}},
+		// Never contained (a false negative here is a lockout) but logged as
+		// UNVERIFIED — see the WARNING line.
+		{"payload named sshd (unverified, logged)", model.Event{PID: 666, PPID: 1, Comm: "sshd"}},
+	}
+	for _, c := range never {
+		if ok, _ := containmentSafe(c.ev, selfPID, testProc, sshd); ok {
 			t.Errorf("%s: must NOT be containable", c.name)
 		}
+	}
+	if _, why := containmentSafe(model.Event{PID: 666, PPID: 1, Comm: "sshd"}, selfPID, testProc, sshd); !strings.Contains(why, "unverified") {
+		t.Errorf("an impostor sshd must be reported as unverified, got %q", why)
+	}
+}
+
+func TestSameMountNS(t *testing.T) {
+	if ok, why := sameMountNS(testProc, 800); !ok {
+		t.Errorf("host writer: %s", why)
+	}
+	if ok, _ := sameMountNS(testProc, 801); ok {
+		t.Error("a writer in another mount namespace must not trigger a host heal")
+	}
+	if ok, _ := sameMountNS(testProc, 31337); ok {
+		t.Error("a writer that is gone must not trigger a heal")
 	}
 }
 
@@ -227,23 +287,6 @@ func TestStartupRecordFailureIsFatal(t *testing.T) {
 	a.audit.Close() // writes now fail
 	if err := a.announceStartup([]string{config.FeatureFreeze}, nil); err == nil {
 		t.Fatal("a startup/arming record that cannot be written must be fatal")
-	}
-}
-
-func TestContainmentIgnoresSpoofedComm(t *testing.T) {
-	cases := []struct {
-		name string
-		ev   model.Event
-	}{
-		{"payload named sshd", model.Event{PID: fakeSSHDPID, Comm: "sshd", PPID: 1, ParentComm: "bash"}},
-		{"child of a fake sshd", model.Event{PID: 900, PPID: fakeSSHDPID, Comm: "sh", ParentComm: "sshd"}},
-		{"payload named phaged", model.Event{PID: fakePhagedPID, Comm: "phaged", PPID: 1, ParentComm: "bash"}},
-		{"child of a fake phaged", model.Event{PID: 901, PPID: fakePhagedPID, Comm: "sh", ParentComm: "phaged"}},
-	}
-	for _, c := range cases {
-		if ok, why := containmentSafe(c.ev, selfPID, fakeExe); !ok {
-			t.Errorf("%s: exempted from containment (%s); comm must not grant trust", c.name, why)
-		}
 	}
 }
 

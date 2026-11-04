@@ -23,7 +23,6 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/audit"
 	"github.com/AzozzALFiras/Phage/internal/control"
 	"github.com/AzozzALFiras/Phage/internal/enrich"
-	"github.com/AzozzALFiras/Phage/internal/enrich/process"
 	"github.com/AzozzALFiras/Phage/internal/event/kind"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/honeytoken"
@@ -65,7 +64,8 @@ type App struct {
 	// (swappable in tests).
 	selfPID int32
 	getppid func() int
-	exeOf   func(pid int32) string
+	proc    procView      // /proc reads (fake in tests)
+	sshd    *sshdIdentity // host sshd binaries by inode
 
 	started time.Time
 	// counters and the recent-alerts ring back the control interface.
@@ -114,7 +114,8 @@ func New(cfg config.Config, objPath string, store profile.Repository, meta Meta)
 		meta:        meta,
 		selfPID:     int32(os.Getpid()),
 		getppid:     os.Getppid,
-		exeOf:       process.Exe,
+		proc:        hostProc{},
+		sshd:        newSSHDIdentity(),
 	}
 }
 
@@ -411,7 +412,10 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	contained := false
 	switch want {
 	case action.Isolate:
-		if a.netq != nil {
+		if ok, why := containmentSafe(ev, a.selfPID, a.proc, a.sshd); !ok {
+			log.Printf("CONTAIN pid=%d comm=%q ISOLATE SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
+			want = action.Notify
+		} else if a.netq != nil {
 			if err := a.netq.Isolate(ev.PID); err != nil {
 				log.Printf("ISOLATE pid=%d failed: %v", ev.PID, err)
 			} else {
@@ -426,7 +430,7 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		}
 	}
 	if want == action.Freeze && a.cfg.Armed(config.FeatureFreeze) {
-		if ok, why := containmentSafe(ev, a.selfPID, a.exeOf); !ok {
+		if ok, why := containmentSafe(ev, a.selfPID, a.proc, a.sshd); !ok {
 			log.Printf("CONTAIN pid=%d comm=%q SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
 		} else if err := a.freezer.Freeze(ev.PID); err != nil {
 			log.Printf("CONTAIN pid=%d failed: %v", ev.PID, err)
@@ -441,7 +445,13 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	// independent of the process-containment rung above.
 	if ev.Kind == kind.FileWrite && v.Score >= a.cfg.Thresholds.Contain &&
 		a.cfg.Armed(config.FeatureSelfHeal) && a.healer != nil && a.healer.Watched(ev.File.Path) {
-		if a.healer.Claim(ev.File.Path) { // one pending heal per path, however many writes
+		// The event's path was resolved in the WRITER's mount namespace: only a
+		// writer in the host's namespace can have touched the host file we
+		// snapshotted. Checked now, while the writer is most likely alive; a
+		// writer already gone is not healed (the alert stands).
+		if ok, why := sameMountNS(a.proc, ev.PID); !ok {
+			log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
+		} else if a.healer.Claim(ev.File.Path) { // one pending heal per path, however many writes
 			go a.selfHeal(ev.File.Path)
 		}
 	}
@@ -764,69 +774,6 @@ func (a *App) deadMansSwitch(ctx context.Context) {
 			ewma = 0.5*ewma + 0.5*float64(delta)
 		}
 	}
-}
-
-// criticalComms is a hard safety allowlist: processes Phage must never freeze,
-// because doing so could lock an operator out of the machine or wedge the
-// system. This is a deliberate hardcoded guardrail (not a learned signal) — it
-// exists because enforce mode once froze SSH logins and locked the box out.
-//
-// sshd and the agent itself are NOT here: a comm name is chosen by the process,
-// so an attacker naming their payload "sshd" would have been unfreezable. sshd
-// is recognised by its executable path (sshdExes) and the agent by its pid.
-var criticalComms = map[string]bool{
-	"systemd": true, "init": true, "login": true,
-	"agetty": true, "getty": true, "systemd-logind": true,
-	"dbus-daemon": true, "systemd-journal": true,
-}
-
-// sshdExes are the OpenSSH server binaries (the listener, and the per-session
-// sshd-session / sshd-auth helpers of OpenSSH >= 9.8) at their usual install
-// paths. Only a process whose /proc/<pid>/exe resolves to one of these counts
-// as sshd for the never-freeze guardrail. Writing to these paths needs root.
-var sshdExes = map[string]bool{
-	"/usr/sbin/sshd": true, "/sbin/sshd": true, "/usr/bin/sshd": true,
-	"/usr/local/sbin/sshd": true, "/usr/local/bin/sshd": true,
-	"/usr/lib/openssh/sshd-session": true, "/usr/libexec/openssh/sshd-session": true,
-	"/usr/lib/ssh/sshd-session": true, "/usr/libexec/sshd-session": true,
-	"/usr/lib/openssh/sshd-auth": true, "/usr/libexec/openssh/sshd-auth": true,
-	"/usr/lib/ssh/sshd-auth": true, "/usr/libexec/sshd-auth": true,
-}
-
-// isSSHD reports whether pid is running an OpenSSH server binary, by resolved
-// executable path. A binary replaced on disk by a package upgrade reads as
-// "<path> (deleted)" and still counts.
-func isSSHD(pid int32, exeOf func(int32) string) bool {
-	if pid <= 0 || exeOf == nil {
-		return false
-	}
-	return sshdExes[strings.TrimSuffix(exeOf(pid), " (deleted)")]
-}
-
-// containmentSafe is the HARD never-lock-out guardrail on a freeze: it refuses to
-// contain (a) anything backed by an interactive login session — never lock out
-// the admin path — and (b) control-plane processes or their children. It no
-// longer checks "is this a privilege escalation": the graduated-response matrix
-// now decides *which* events ever reach a freeze (a no-session root raise, a
-// honeytoken read, a tamper attempt), so proportionality lives there, and this
-// stays a pure safety gate. Exec/file/enable verdicts never freeze because the
-// matrix returns a lighter rung for them.
-//
-// self is the agent's own tgid; exeOf resolves a pid's executable path.
-func containmentSafe(ev model.Event, self int32, exeOf func(int32) string) (bool, string) {
-	if ev.Session.Interactive {
-		return false, "interactive login session"
-	}
-	if ev.PID == self || (ev.PPID != 0 && ev.PPID == self) {
-		return false, "the agent itself"
-	}
-	if isSSHD(ev.PID, exeOf) || isSSHD(ev.PPID, exeOf) {
-		return false, "control-plane process (sshd)"
-	}
-	if criticalComms[ev.Comm] || criticalComms[ev.ParentComm] {
-		return false, "control-plane process"
-	}
-	return true, ""
 }
 
 // labelFor is a coarse display bucket; the response matrix, not this, decides
