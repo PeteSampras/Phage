@@ -38,10 +38,14 @@ it gets the directory's default SELinux context; the snapshot's
 owner/group/mode with `fchown`/`fchmod`, and `renameat`-ed over the target.
 Whatever the attacker left at the path — an oversized file, a symlink, a FIFO —
 is never followed or read through but is replaced; the evidence copy is
-truncated or records the symlink target. The heal is refused only if a path
+truncated or records the symlink target. The heal is refused if a path
 component is a symlink, the parent directory was swapped since the snapshot,
-the parent is owned by neither root nor the file's owner, or the target is now
-a directory.
+the parent is owned by neither root nor the file's owner, the parent is group-
+or world-writable (sticky or not), or the target is now a directory. A sentinel
+in a shared directory is not watched at all, because another user could plant
+or delete it between any check and the restore. Writers whose access comes
+from a group or a POSIX ACL are alerted but never healed (only uid 0 or the
+owning uid count), and an ACL-shared directory is not detected as shared.
 
 **Who may trigger a heal, and of which file?** The event's path is resolved in
 the *writer's* view of the filesystem, which may not be the host's (a
@@ -51,8 +55,12 @@ both required:
 
 1. **The writer could have written the host file**: its real uid in the init
    namespace (from the kernel event) is 0 or the host file's **current**
-   owner, read at decision time through the verified directory (the directory's
-   owner if the file is absent). This is checked first, on every path. Without
+   owner, read at decision time through the verified directory. An absent file
+   has no owner, so only a root writer qualifies. The gate checks this before
+   the inode comparison, and Heal re-checks it under the verified directory fd
+   just before restoring: a non-root writer may restore only a file that exists
+   and is owned by it (and by the snapshot owner). If several write-opens
+   arrive during one heal, the least-privileged writer counts. Without
    it, an unprivileged user in its own user+mount namespace can put a tmpfs
    over the directory, write a private copy (that is the event), then `rm` it
    or `umount` the tmpfs so its view resolves to the host inode again, and make

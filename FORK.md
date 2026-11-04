@@ -191,12 +191,24 @@ docs moved together). `git log 9757354..` lists each commit.
      the view resolves to the *host* inode again (round 4).
    - The gate compared the writer with the *snapshot* owner, not the current
      one (round 4).
+   - In a directory the attacker can write (group/world-writable, or sticky
+     with the file absent), the attacker could plant its own file, so that
+     it is the current owner and passes the gate, then delete it during the
+     heal delay. Heal skipped the owner check on a missing file and recreated
+     a root-owned file (round 5).
 
    *Fix (current):* the gate has two conditions, both required.
    - **The writer could have written the host file.** Its real uid in the
      init namespace is 0 or the file's **current** owner, read at decision
-     time through the verified directory (the directory's owner if the file
-     is absent). This is checked first, on every branch.
+     time through the verified directory. An absent file has no owner, so
+     only a root writer qualifies. The gate checks this before the inode
+     comparison, and Heal re-checks it under the verified directory fd right
+     before restoring. At that point a non-root writer may restore only a
+     file that exists and is owned by that writer and by the snapshot owner;
+     an absent file is recreated only for a root writer. When several events
+     are folded into one rerun (the dirty bit), the least-privileged writer's
+     uid is used: non-root wins over root, and two different non-root uids
+     refuse.
    - **The writer's view does not name a different file.** The path, resolved
      in `/proc/<pid>/root` with `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`,
      must be the host file's dev+ino. A container's own copy is never healed
@@ -204,9 +216,23 @@ docs moved together). `git log 9757354..` lists each commit.
      uid condition alone decides, and Heal then compares the host file with
      its snapshot.
 
-   In addition, **Heal refuses (audited `failed:`) if the file's current owner
-   differs from its snapshot owner**, so it never hands a file back to an old
-   owner.
+   In addition:
+   - **Heal refuses (audited `failed:`) if the file's current owner differs
+     from its snapshot owner**, so it never hands a file back to an old owner.
+   - **Sentinels in a group- or world-writable directory (sticky or not) are
+     never watched** ("not watching" at startup), and a directory that becomes
+     shared later is refused at heal time.
+   - **Group and ACL writers are never healed.** Only uid 0 or the file's
+     owning uid can trigger a heal. Write access granted to a group, or by a
+     POSIX ACL, is invisible to the check, so such a writer's event is
+     alerted but never healed. A directory whose write access comes from an
+     ACL rather than from mode bits is *not* detected as shared, so do not
+     watch sentinels in such directories.
+   - **PID reuse can only suppress a heal.** If the writer's pid is reused
+     before the gate looks, the gate checks the new process's view of the
+     path. That can only turn up "a different file" and veto the heal. It
+     cannot authorise one, because the uid comes from the kernel event, not
+     from the pid.
 
    This narrows who can trigger a wrong heal; it does not make self-heal safe:
    - Only real uids are checked; the sensor records no euid/fsuid for file
@@ -306,8 +332,10 @@ mean to use it by hand.
   - **Wrong heal.** The reverse trick (write a private copy, then unmount or
     remove it) can still cause a wrong heal, but since round 4 only for a
     writer whose uid is root (including container root without a userns
-    remap) or the file's current owner. Unprivileged non-owners are refused
-    on every branch.
+    remap) or the file's current owner. Since round 5, a non-root writer can
+    no longer make the agent recreate a missing file, and the uid is
+    re-checked just before the restore. An unprivileged non-owner is refused
+    by the gate and again by Heal.
 
   Both disappear once the sensor records the dev+ino of the opened inode
   (`file->f_inode`), and the euid/fsuid, in-kernel. That needs a BPF change,
