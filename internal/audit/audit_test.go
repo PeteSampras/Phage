@@ -3,6 +3,7 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -80,5 +81,22 @@ func TestOpenRefusesFIFOWithoutHanging(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Open hung on a FIFO")
+	}
+}
+
+// A device node at the audit path must be refused by the regular-file check
+// (it would otherwise "work": writes to a /dev/null clone vanish silently).
+func TestOpenRefusesDeviceNode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := syscall.Mknod(p, syscall.S_IFCHR|0o600, int(1<<8|3)); err != nil { // like /dev/null (1,3)
+		t.Skipf("cannot mknod a character device here (needs root): %v", err)
+	}
+	w, err := Open(p)
+	if err == nil {
+		w.Close()
+		t.Fatal("Open accepted a character device as the audit trail")
+	}
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Skipf("device refused before the regular-file check (e.g. a nodev mount): %v", err)
 	}
 }
