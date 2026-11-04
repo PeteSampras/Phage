@@ -76,7 +76,7 @@ if [[ "${ALLOW_DIRTY:-}" != 1 ]]; then
 fi
 
 # --- the rest of the install set and provenance ------------------------------
-cp deploy/phage.service configs/phage.example.yaml LICENSE "$out/"
+cp deploy/phage.service configs/phage.example.yaml LICENSE deploy/wazuh/phage-heartbeat-check "$out/"
 {
 	echo "version $version"
 	echo "commit $commit"
@@ -87,7 +87,7 @@ cp deploy/phage.service configs/phage.example.yaml LICENSE "$out/"
 
 (
 	cd "$out"
-	sha256sum phaged phage phage-jail bpf/*.bpf.o phage.service phage.example.yaml LICENSE BUILDINFO >SHA256SUMS
+	sha256sum phaged phage phage-jail bpf/*.bpf.o phage.service phage.example.yaml phage-heartbeat-check LICENSE BUILDINFO >SHA256SUMS
 )
 echo "release: $out (commit $commit)"
 echo "release: verify with: (cd $out && sha256sum -c SHA256SUMS)"

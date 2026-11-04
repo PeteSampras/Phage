@@ -38,6 +38,99 @@ Every host-modifying feature is **off by default**:
 
 With no `enforcement:` key on, `enforce` behaves exactly like `alert`.
 
+## Reporting: novelty rows, heartbeat, baseline review
+
+None of this acts on the host or arms anything; it only writes files phaged
+owns. It makes Phage a second source for homelab-next's novelty analyzer
+(ADR-0036 decisions 6-7) and observable as a SOC sensor (see
+[docs/wazuh.md](docs/wazuh.md)).
+
+**Novelty rows** (`output.novelty_path`, default
+`/var/lib/phage/novelty.jsonl`, written in alert and enforce mode; empty
+disables it). One JSON line per verdict at or above `thresholds.notify`, in
+the shape of homelab-next's `novelty_finding` table:
+
+| Column | Phage writes |
+|---|---|
+| `source` | `output.source`, default `phage-host` (never `lake-novelty`) |
+| `source_kind` | always `heuristic`: advisory, never a basis to act alone |
+| `profile` | the event kind: `exec`, `connect`, `file-write`, `enable`, `creds-change`, `self-defense`, `honeytoken` |
+| `entity_kind`, `entity` | `output.entity_kind` (default `host`) and `output.entity` (default: the host name at startup). Set them to the text a lake profile uses for this host, e.g. `entity_kind: ip` with the canonical address, so `corroborate` sees one entity |
+| `value` | the concrete object: the path (file-write, honeytoken), `ip:port` (connect), the op (enable), the signal (self-defense), else the executable |
+| `status` | `finding`, or `unlearned` (below) |
+| `score`, `confidence` | findings only: the verdict's score, and the confidence of its top reason |
+| `support`, `entity_total` | the top reason's feature: times the value was learned, and observations of the feature |
+| `time`, `as_of` | when the kernel saw the event (back-dated by the measured lag), and when the row was written |
+| `uid` | `phage-` + a digest of source, profile, status, entity kind, entity, value and the event's `output.novelty_bucket` (default 1h): a repeat within one bucket has the same uid and is written once |
+| `message`, `reasons` | the explanation, each reason with its arithmetic, and `baseline sha256:<hex>` |
+| `tlp` | `output.tlp` |
+
+The schema is copied into `internal/novelty/testdata` (homelab-next
+`47042a0`), and every row shape is validated against it in the tests.
+
+- **`unlearned` fixes a silence.** The scorer treats a feature it never
+  observed as neutral, so a host that never egressed while learning scored
+  its first egress 0 and said nothing. Now, when *every* feature key of an
+  event's class has no observation in the baseline, phaged logs `UNLEARNED`
+  (once per uid bucket) and writes an `unlearned` row with no score. It is
+  never a verdict: no response, no response record, nothing acted on. A
+  class with any observation is scored as before; a single never-observed key
+  inside a learned class is still neutral.
+- **TLP: the default is `red`, and only the five canonical TLP 2.0 labels are
+  accepted** (`clear`, `green`, `amber`, `amber+strict`, `red`; `TLP:AMBER`,
+  `Amber` and `white` are refused). *Decision for review:* requiring the key
+  whenever the sink is on would make every existing alert-mode config fail
+  to start after an upgrade (a crash loop that leaves the host unmonitored),
+  and `amber` is a guess about how widely host paths, addresses and program
+  names may be shared. `red` cannot over-share. Its cost: homelab-next's
+  `corroborate` reads below `red`, so red rows never corroborate. **Set
+  `output.tlp` to the label you mean** (likely `amber`) to make Phage a
+  corroborating source; the startup log line and the `startup` record show
+  the label in use.
+- The file is opened like the audit trail (`O_APPEND|O_NOFOLLOW|O_CLOEXEC`,
+  0600, regular files only). It rotates to `novelty.jsonl.1` at
+  `output.novelty_max_bytes` (default 64 MiB); with `0` it never rotates,
+  and logrotate `copytruncate` is safe because every write is `O_APPEND`.
+  A sink that cannot be opened stops startup. A failed write is logged
+  (`NOVELTY SINK WRITE FAILED`, at most once a minute with a count) and
+  counted in the heartbeat; it never stops the daemon.
+- Getting rows into the lake table is a separate step: they must be written
+  through the lake's writer under Phage's own source (ADR-0036 decision 6).
+
+**Heartbeat.** Every `output.heartbeat_interval` seconds (default 60), in
+every mode, a `heartbeat` audit record: events/s, ring-buffer **drops** in
+the interval and in total, enrichment lag (kernel timestamp to enriched
+event, average and maximum ms), novelty rows/suppressed/errors, baseline
+overflow, checkpoint errors, the mode, the armed features and the baseline's
+sha256. Drops come from a per-CPU counter in `sensors.bpf.c` that every
+sensor increments when `bpf_ringbuf_reserve` fails; a drop is also logged
+(`SENSOR DROPS`). `phage status` shows the same numbers. A SIEM alerts on
+drops and on the heartbeat going missing (`deploy/wazuh/`).
+
+**Baseline.** In learn mode the baseline is checkpointed every
+`learn.checkpoint_interval` (default 10m) when it changed, by the same
+atomic temp-file-and-rename as the shutdown save, so a crash loses at most
+one interval; a failed checkpoint is logged (`BASELINE CHECKPOINT FAILED`)
+and counted. The sha256 of the baseline file is logged at startup and
+carried in the `startup` and `heartbeat` records. Each feature learns at most
+`learn.max_values_per_key` distinct values (default 10000): a new value past
+the cap still counts as an observation but is not learned (so it stays
+novel), is counted as overflow (persisted in the baseline, shown in the
+heartbeat and `phage baseline show`), and is logged once per feature.
+
+Before switching a host from learn to alert, review what it learned:
+
+```sh
+cp /var/lib/phage/baseline.json /root/baseline-week1.json   # keep a copy now and then
+phage baseline show /var/lib/phage/baseline.json            # per feature: observations, distinct, established, overflow
+phage baseline diff /root/baseline-week1.json /var/lib/phage/baseline.json
+```
+
+`diff` lists, per feature, values added and removed, and values that became
+established (will no longer alert) or stopped being so. Ports and flags read
+as numbers; program, pair and file-class values are stable hash ids. Both
+commands only read the files and need no daemon.
+
 ## Turning features on
 
 These features can be enabled **only** in `/etc/phage/phage.yaml`:
@@ -117,8 +210,16 @@ created 0600.
 - **Self-heal records** (`kind: self_heal`), one per heal attempt: `outcome`
   is `healed`, `unchanged` or `failed:<err>`, along with the `path`, the
   `evidence` location, and the writer's pid and comm.
+- **`startup` also carries** `baseline_sha256` (`none` on a fresh host) and,
+  in alert and enforce mode, `novelty_path`, `novelty_entity`
+  (`<entity_kind>:<entity>`) and `tlp`.
+- **Heartbeat records** (`kind: heartbeat`), every
+  `output.heartbeat_interval` seconds in every mode, with a `health` object
+  (see Reporting above). Every `health` field is always present, so a rule can
+  match a zero.
 - **Failing to write a startup, arming or disarm record is fatal.** A failed
-  response or self-heal record during the run is only logged.
+  response, self-heal or heartbeat record during the run is only logged; a
+  missing heartbeat is itself what the SIEM alerts on.
 
 ## What stops phaged from starting (monitor it)
 
@@ -130,6 +231,11 @@ the following becomes a crash loop that leaves the host **unmonitored**:
   booleans, an invalid combination, or a missing file;
 - a removed flag (`-heal`, `-protect`, `-honeytokens`) left in a drop-in;
 - a `-mode` that would raise the file's mode;
+- in alert or enforce mode, a novelty sink (`output.novelty_path`) that
+  cannot be opened (a symlink, a FIFO, a full or read-only `/var`), or, with
+  `output.entity` unset, a host name that is empty or not a valid entity;
+- an invalid `output:` or `learn:` value (a TLP that is not one of the five
+  canonical labels, a malformed source or entity, an out-of-range interval);
 - a corrupt baseline (`/var/lib/phage/baseline.json` that is not valid JSON —
   e.g. truncated by a full disk). A *missing* baseline is fine (fresh host);
   to recover, move the bad file aside (this restarts learning);
@@ -140,7 +246,38 @@ the following becomes a crash loop that leaves the host **unmonitored**:
 
 Alert on it: watch `systemctl show -p NRestarts,ActiveState phage` (or the
 node-exporter systemd collector), or add an `OnFailure=` unit that pages, and
-alert on disk space for `/var/lib/phage`.
+alert on disk space for `/var/lib/phage`. `deploy/wazuh/` does this for Wazuh:
+a rule for three starts within ten minutes, an agent-side check of
+`phage.service`, and an agent-side check that fires when no heartbeat has been
+written for three intervals (Wazuh rules cannot fire on an absent event; see
+[docs/wazuh.md](docs/wazuh.md)).
+
+## Building a release
+
+`make release` (`scripts/build/release.sh`) is the in-house build of what
+gets deployed. It builds from the checked-out commit and refuses a dirty tree
+(`ALLOW_DIRTY=1` for a throwaway, marked `-dirty`), and requires the Go
+toolchain to be exactly the version `go.mod` pins. It runs with
+`GOTOOLCHAIN=local`; `GOTOOLCHAIN=go<that version>` is also accepted, and go
+then fetches exactly that toolchain, checksum-verified. It regenerates
+`vmlinux.h` from the build host's kernel BTF (`BPFTOOL=` names a versioned
+bpftool), rebuilds every eBPF object, and builds `phaged`, `phage` and
+`phage-jail` with `CGO_ENABLED=0 -trimpath -buildvcs=true` and an empty build
+id. It then checks with `go version -m` that the commit is embedded,
+unmodified. Output goes to `dist/release/<version>/`: binaries, `bpf/*.bpf.o`,
+the unit, the example config, the heartbeat check, the licence, a `BUILDINFO`
+(toolchains, the `vmlinux.h` sha256, the kernel), and `SHA256SUMS` over all
+of it. Two clean builds of one commit on one host were byte-identical.
+
+```sh
+git checkout <reviewed-commit-sha>
+make release                                   # or GOTOOLCHAIN=go1.25.0 make release
+(cd dist/release/<version> && sha256sum -c SHA256SUMS)
+sudo make install BIN=dist/release/<version>   # installs those binaries and bpf/build/*.bpf.o
+```
+
+The eBPF objects are CO-RE, but their bytes depend on the clang version and
+the build host's `vmlinux.h`; `BUILDINFO` records both.
 
 ## What changed and why
 
@@ -382,6 +519,21 @@ mean to use it by hand.
   loading the BPF programs fails in this sandbox. The startup and arming
   records are covered by unit tests, and the flag rules were checked against
   the built binary.
+- **The ring-buffer drop counter was not load-tested.** `make bpf` compiles
+  every object with the counter; a test reads the compiled object (the map's
+  type and sizes, and that every program writing the ring buffer also
+  references the counter), and the userspace read is run against a real
+  per-CPU map created in the test (map creation works here; program loads get
+  EPERM). The in-kernel increment on a failed reservation has never run.
+  Verify on a real host by filling the ring buffer (e.g. `SIGSTOP` phaged for
+  a few seconds under load) and watching `phage status` and the heartbeat.
+- **Novelty, heartbeat and checkpoints were not run in the daemon.** They are
+  driven through `App.handle` and the heartbeat/checkpoint functions in unit
+  tests; `Run` itself (sink opening order, goroutine start) needs a host that
+  can load the sensors.
+- **The Wazuh content was not run on a Wazuh manager.** Its tests model the
+  rule matching and run the heartbeat check; validate with `wazuh-logtest`
+  (docs/wazuh.md) before relying on it.
 - **Release workflow.** `.github/workflows/release.yml` from upstream is
   unchanged. It runs only when a tag is pushed, and nothing in this fork
-  consumes its output.
+  consumes its output; the fork's build is `make release` (above).

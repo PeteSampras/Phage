@@ -217,8 +217,8 @@ a Linux host from a reviewed commit and install what you built:
 ```sh
 git clone https://github.com/PeteSampras/phage.git && cd phage
 git checkout <reviewed-commit-sha>   # pin: never build an unreviewed tip
-make gen-vmlinux bpf build            # needs Go, clang/llvm and libbpf headers
-sudo make install                     # starts nothing; see below
+make release                          # pinned build: go.mod's Go, static, -trimpath, commit embedded, SHA256SUMS
+sudo make install BIN=dist/release/<version>   # starts nothing; see below
 sudo systemctl daemon-reload && sudo systemctl enable --now phage
 ```
 
@@ -230,7 +230,8 @@ It lays the pieces out like this:
 | `/usr/local/lib/phage/*.bpf.o` | the compiled eBPF sensors |
 | `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`, every enforcement and deception feature off) |
 | `/etc/systemd/system/phage.service` | the systemd unit |
-| `/var/lib/phage/` | the learned baseline and the audit trail |
+| `/usr/local/lib/phage/phage-heartbeat-check` | the agent-side "is phaged still reporting?" check for Wazuh ([docs/wazuh.md](docs/wazuh.md)) |
+| `/var/lib/phage/` | the learned baseline, the audit trail and (alert/enforce) the novelty file |
 
 Requires Linux with kernel BTF (`/sys/kernel/btf/vmlinux`); runs as root because
 it loads eBPF and drives the cgroup freezer.
@@ -244,14 +245,17 @@ never skip it:
 ```sh
 systemctl status phage      # is it running?
 journalctl -u phage -f      # watch it, live
-phage status                # mode, uptime, events, alerts, contained
+phage status                # mode, uptime, events, alerts, contained; drops, events/s, lag, baseline sha256
 phage events                # the recent verdicts, each with its reasons
 phage thaw <pid>            # manually release a contained process
+phage baseline show <file>  # what a baseline learned (read-only)
+phage baseline diff <old> <new>   # what changed between two baselines (read-only)
 ```
 
 1. **Learn** *(days, not minutes — the default)* — builds a per-host baseline and
    does nothing else. Give it long enough to see your normal: weekly cron,
-   deploys, backups.
+   deploys, backups. The baseline is checkpointed every 10 minutes; before
+   moving on, review it with `phage baseline show` / `phage baseline diff`.
 2. **Alert** — when the baseline is mature, set `mode: alert` in
    `/etc/phage/phage.yaml` and `systemctl restart phage`. Now it scores and warns
    but still never acts; this is where you confirm it's quiet on a normal day.
@@ -294,6 +298,18 @@ still load. Without `-config` the mode is learn and `-mode` cannot raise it.
 phaged fails closed on a full `/var` or a broken config — monitor
 `phage.service` restarts (see [FORK.md](FORK.md)).
 
+**Reporting.** In alert and enforce mode each verdict at or above the notify
+threshold is also written to `/var/lib/phage/novelty.jsonl` as a row of
+homelab-next's `novelty_finding` table (advisory, `source_kind: heuristic`),
+and an event whose kind was never seen while learning is written as
+`unlearned` instead of being silently scored 0. Set `output.tlp` (it defaults
+to `red`) and `output.entity`. Every minute, in every mode, a `heartbeat`
+audit record reports events/s, kernel ring-buffer drops, enrichment lag and
+the baseline's sha256. `deploy/wazuh/` has the decoder, rules and agent
+checks, including one for a heartbeat that stops; see
+[FORK.md](FORK.md#reporting-novelty-rows-heartbeat-baseline-review) and
+[docs/wazuh.md](docs/wazuh.md).
+
 To remove everything: `sudo make uninstall` from the clone — it keeps your config
 and baseline unless you also delete `/etc/phage` and `/var/lib/phage`.
 
@@ -303,9 +319,11 @@ and baseline unless you also delete `/etc/phage` and `/var/lib/phage`.
 stub covers non-Linux); the eBPF sensors build and run on Linux with kernel BTF.
 
 ```sh
+make gen-vmlinux    # bpf/include/vmlinux/vmlinux.h from this kernel's BTF (BPFTOOL= to pick a bpftool)
 make bpf            # compile the eBPF sensors (Linux; needs clang + libbpf)
 make build          # build bin/phaged, bin/phage, bin/phage-jail
 make test           # Go unit tests (build anywhere)
+make release        # the pinned in-house build the fork deploys (FORK.md "Building a release")
 
 sudo ./bin/phaged -bpf bpf/build/sensors.bpf.o -mode learn   # run straight from the tree
 sudo make install                                            # or install what you just built

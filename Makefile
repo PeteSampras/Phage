@@ -77,6 +77,7 @@ install: ## Install binaries, eBPF objects, config, and the systemd unit (Linux,
 	install -d $(BINDIR) $(LIBDIR) $(SYSCONFDIR) $(UNITDIR)
 	install -m 0755 $(BIN)/phaged $(BIN)/phage $(BIN)/phage-jail $(BINDIR)/
 	install -m 0644 bpf/build/*.bpf.o $(LIBDIR)/
+	install -m 0755 deploy/wazuh/phage-heartbeat-check $(LIBDIR)/
 	install -m 0644 deploy/phage.service $(UNITDIR)/phage.service
 	@if [ -f $(SYSCONFDIR)/phage.yaml ]; then \
 		echo "keeping existing $(SYSCONFDIR)/phage.yaml"; \
