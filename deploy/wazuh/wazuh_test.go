@@ -128,7 +128,7 @@ func matches(t *testing.T, r rule, fields map[string]string, line, location stri
 	if r.DecodedAs != "" && (r.DecodedAs != "json" || !isJSON) {
 		return false
 	}
-	if r.Location != "" && !strings.Contains(location, r.Location) {
+	if r.Location != "" && !osMatch(r.Location, location) {
 		return false
 	}
 	for _, f := range r.Fields {
@@ -151,6 +151,24 @@ func matches(t *testing.T, r rule, fields map[string]string, line, location stri
 		return false
 	}
 	return true
+}
+
+// osMatch models Wazuh's OS_Match: `|` separates alternatives, a leading
+// `^` anchors one at the start and a trailing `$` at the end; the rest is a
+// literal (case-insensitive in Wazuh; the paths here are lower case).
+func osMatch(pattern, s string) bool {
+	for _, alt := range strings.Split(pattern, "|") {
+		start, end := strings.HasPrefix(alt, "^"), strings.HasSuffix(alt, "$")
+		lit := strings.TrimSuffix(strings.TrimPrefix(alt, "^"), "$")
+		switch {
+		case start && end && s == lit,
+			start && !end && strings.HasPrefix(s, lit),
+			!start && end && strings.HasSuffix(s, lit),
+			!start && !end && strings.Contains(s, lit):
+			return true
+		}
+	}
+	return false
 }
 
 // fire returns the rule that would fire for an event: the first matching root
@@ -303,11 +321,24 @@ func TestRulesFireOnPhageRecords(t *testing.T) {
 			t.Errorf("%s: fired %q, want %q\n  %s", name, got, c.want, c.line)
 		}
 	}
-	// The same records from another file trip nothing.
-	for _, l := range []string{line(t, startup("armed")), line(t, id.Unlearned(ev, nil, "none", time.Now()))} {
-		if got := fireAt(t, rules, l, "(web01) any->/var/log/app/events.json"); got != "" {
-			t.Errorf("a record from another file fired %s", got)
+	// The same records from another file trip nothing, and both location
+	// forms (agent and manager-local) match.
+	armedLine := line(t, startup("armed"))
+	for loc, want := range map[string]string{
+		"(web01) any->/var/lib/phage/audit.jsonl":           "100802",
+		"/var/lib/phage/audit.jsonl":                        "100802",
+		"(web01) any->/var/log/app/events.json":             "",
+		"(web01) any->/var/lib/phage/audit.jsonl.1":         "",
+		"(web01) any->/srv/x/var/lib/phage/audit.jsonl.bak": "",
+		"/tmp/var/lib/phage/audit.jsonl":                    "",
+	} {
+		if got := fireAt(t, rules, armedLine, loc); got != want {
+			t.Errorf("startup armed from %q fired %q, want %q", loc, got, want)
 		}
+	}
+	unl := line(t, id.Unlearned(ev, nil, "none", time.Now()))
+	if got := fireAt(t, rules, unl, "(web01) any->/var/lib/phage/audit.jsonl"); got != "" {
+		t.Errorf("a novelty row read from the audit trail fired %s", got)
 	}
 }
 
@@ -399,6 +430,32 @@ func TestDecoderPatternCompiles(t *testing.T) {
 }
 
 // The agent-side check prints the line rule 100840 matches.
+// The check sets its own PATH: a hostile PATH (a planted tac or date) is
+// never used.
+func TestHeartbeatCheckIgnoresCallerPATH(t *testing.T) {
+	if _, err := exec.LookPath("tac"); err != nil {
+		t.Skip("tac not available")
+	}
+	script, _ := filepath.Abs("phage-heartbeat-check")
+	evil := t.TempDir()
+	for _, tool := range []string{"tac", "date", "grep", "cut"} {
+		os.WriteFile(filepath.Join(evil, tool), []byte("#!/bin/sh\necho PWNED\n"), 0o755)
+	}
+	trail := filepath.Join(t.TempDir(), "audit.jsonl")
+	hb := heartbeat(audit.Health{})
+	hb.Time = time.Now()
+	os.WriteFile(trail, []byte(line(t, hb)+"\n"), 0o600)
+	cmd := exec.Command(script, "180", trail)
+	cmd.Env = []string{"PATH=" + evil}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "PWNED") || !strings.HasPrefix(string(out), "status=fresh") {
+		t.Errorf("output %q: the caller's PATH was used", out)
+	}
+}
+
 func TestHeartbeatCheckScript(t *testing.T) {
 	for _, tool := range []string{"sh", "tac", "date", "grep", "cut"} {
 		if _, err := exec.LookPath(tool); err != nil {

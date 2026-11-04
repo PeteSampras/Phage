@@ -19,9 +19,14 @@
   wazuh-logtest shows how your manager stores `status`, matching it directly
   is equivalent (docs/wazuh.md).
 
-  The parent rules are pinned to the two files by <location>, so another
-  JSON log with similar keys cannot trip them. If you move the files
-  (audit_path, output.novelty_path), change the locations here too.
+  The parent rules are pinned to the two files by <location> (OS_Match, the
+  default type: `|` separates alternatives, `^` and `$` anchor each). An
+  agent's event location reads "(agent) any->/var/lib/phage/audit.jsonl",
+  a manager-local one is the bare path; each alternative matches one form,
+  anchored at the end so audit.jsonl.1 or a path that merely contains
+  ours does not. Another JSON log with similar keys cannot trip them. If
+  you move the files (audit_path, output.novelty_path), change the
+  locations here too, and confirm with wazuh-logtest.
 -->
 <group name="phage,">
 
@@ -29,7 +34,7 @@
 
   <rule id="100800" level="0">
     <decoded_as>json</decoded_as>
-    <location>/var/lib/phage/audit.jsonl</location>
+    <location>->/var/lib/phage/audit.jsonl$|^/var/lib/phage/audit.jsonl$</location>
     <field name="kind" type="pcre2">^(startup|enforcement_armed|disarmed|response|self_heal|heartbeat)$</field>
     <field name="pid" type="pcre2">^-?\d+$</field>
     <field name="reason" type="pcre2">\S</field>
@@ -189,7 +194,7 @@
 
   <rule id="100830" level="0">
     <decoded_as>json</decoded_as>
-    <location>/var/lib/phage/novelty.jsonl</location>
+    <location>->/var/lib/phage/novelty.jsonl$|^/var/lib/phage/novelty.jsonl$</location>
     <field name="source_kind" type="pcre2">^heuristic$</field>
     <field name="uid" type="pcre2">^phage-[0-9a-f]+$</field>
     <description>Phage: novelty row.</description>
@@ -210,7 +215,7 @@
   <rule id="100833" level="7">
     <if_sid>100830</if_sid>
     <field name="message" type="pcre2">\(burst\)$</field>
-    <description>Phage novelty: a burst of new $(profile) rows on $(entity_kind):$(entity) (count $(count); the rest were not written).</description>
+    <description>Phage novelty: a burst of new $(profile) rows on $(entity_kind):$(entity) (more than the per-bucket cap; count is always cap+1, the total is in the heartbeat's novelty_over_cap).</description>
   </rule>
 
   <!-- ===== Agent-side checks (command localfiles) ========================= -->

@@ -42,8 +42,10 @@ buffer was full) during the interval. Any drop means detection was incomplete.
 is set; alert and enforce mode only), one row in homelab-next's `novelty_finding` shape per
 verdict at or above `thresholds.notify` (`finding`, with `score`), per event whose feature class
 was never seen while learning once the baseline is ready (`unlearned`, no score), and one
-`burst` row per profile per bucket once a profile passes `output.novelty_max_per_bucket` new
-rows. Every row is `source_kind: heuristic`: advisory, never a basis to act alone. A finding
+`burst` row per status, profile and bucket once that status passes
+`output.novelty_max_per_bucket` new rows for the profile (findings at or above
+`thresholds.contain` are never capped). **A burst row's `count` is always the cap + 1**; the
+total is the heartbeat's `health.novelty_over_cap`. Every row is `source_kind: heuristic`: advisory, never a basis to act alone. A finding
 row repeats a `response` record, so its rule stays at level 3; an `unlearned` row has no
 response record and alerts at level 6; a `burst` row alerts at level 7. **The agent ships the
 file to the SIEM whatever its rows' TLP label says**: the label travels in each row, and
@@ -77,7 +79,7 @@ Phage's source (homelab-next ADR-0036 decision 6); Wazuh only carries them.
 | 100830 | 0 | a novelty row (parent) |
 | 100831 | 3 | a novelty finding |
 | 100832 | 6 | a novelty `unlearned` row |
-| 100833 | 7 | a novelty `burst` row |
+| 100833 | 7 | a novelty `burst` row (count is always cap + 1; the total is in `health.novelty_over_cap`) |
 | 100840 | 12 | no heartbeat for three intervals, or a heartbeat time more than that far in the future (agent-side check) |
 | 100841 | 12 | `phage.service` is not active (agent-side check) |
 
@@ -127,9 +129,14 @@ a burst when it ends with `(burst)`. Phage's tests hold all three formats. Once 
 shows how your manager stores `status`, matching `<status>^armed$</status>` (or the field) is
 equivalent, and simpler to read.
 
-The two parent rules are pinned to the files with `<location>` (`/var/lib/phage/audit.jsonl`,
-`/var/lib/phage/novelty.jsonl`), so another JSON log with similar keys cannot trip them. If you
-move the files, change the locations.
+The two parent rules are pinned to the files with `<location>`, for example
+`->/var/lib/phage/audit.jsonl$|^/var/lib/phage/audit.jsonl$`. `location` is OS_Match by
+default: `|` separates alternatives and `^`/`$` anchor each one. An agent's event location reads
+`(agent) any->/var/lib/phage/audit.jsonl` and a manager-local one is the bare path; each
+alternative matches one form, anchored at the end, so `audit.jsonl.1` or a longer path that
+merely contains ours does not match. Another JSON log with similar keys cannot trip them. If you
+move the files, change the locations. Confirm the location your manager reports with
+`wazuh-logtest` (the model in the tests assumes these two forms).
 
 ## Why the decoder file is nearly empty
 
@@ -153,7 +160,7 @@ manager and feed `/var/ossec/bin/wazuh-logtest` one line of each kind, for examp
 
 ```
 {"time":"2026-11-04T10:00:00Z","kind":"startup","action":"startup","score":0,"pid":4000,"comm":"phaged","reason":"phaged started: mode=alert status=armed","status":"armed","mode":"alert"}
-{"time":"2026-11-04T10:01:00Z","kind":"heartbeat","action":"heartbeat","score":0,"pid":4000,"comm":"phaged","reason":"heartbeat: 3.10 events/s, 12 drop(s)","mode":"alert","health":{"interval_seconds":60,"events":186,"events_per_sec":3.1,"drops":12,"drops_total":12,"drops_error":"","enrich_lag_ms_avg":0.4,"enrich_lag_ms_max":2.1,"novelty_rows":0,"novelty_suppressed":0,"novelty_errors":0,"baseline_overflow":0,"checkpoint_errors":0}}
+{"time":"2026-11-04T10:01:00Z","kind":"heartbeat","action":"heartbeat","score":0,"pid":4000,"comm":"phaged","reason":"heartbeat: 3.10 events/s, 12 drop(s), enrichment lag avg 0.40ms max 2.10ms","mode":"alert","baseline_sha256":"none","baseline_state":"ready","health":{"interval_seconds":60,"events":186,"events_per_sec":3.1,"drops":12,"drops_total":12,"drops_error":"","enrich_lag_ms_avg":0.4,"enrich_lag_ms_max":2.1,"novelty_rows":2,"novelty_suppressed":5,"novelty_over_cap":0,"novelty_errors":0,"baseline_overflow":0,"baseline_samples":48210,"baseline_state":"ready","checkpoint_errors":0}}
 {"uid":"phage-0123456789abcdef0123456789abcdef01234567","time":"2026-11-04T10:02:00.000000Z","as_of":"2026-11-04T10:02:00.004000Z","source":"phage-host","source_kind":"heuristic","profile":"connect","entity_kind":"host","entity":"web01","value":"192.0.2.7:4444","status":"unlearned","support":0,"entity_total":0,"count":1,"message":"web01: connect 192.0.2.7:4444 by sh (pid 4242): this kind of event was never seen while learning, so it is not scored (unlearned)","reasons":["no observations in the baseline for net.egress_comm_id"],"tlp":"amber"}
 ```
 
