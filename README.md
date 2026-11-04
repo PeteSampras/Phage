@@ -231,7 +231,7 @@ It lays the pieces out like this:
 | `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`, every enforcement and deception feature off) |
 | `/etc/systemd/system/phage.service` | the systemd unit |
 | `/usr/local/lib/phage/phage-heartbeat-check` | the agent-side "is phaged still reporting?" check for Wazuh ([docs/wazuh.md](docs/wazuh.md)) |
-| `/var/lib/phage/` | the learned baseline, the audit trail and (alert/enforce) the novelty file |
+| `/var/lib/phage/` | the learned baseline, the audit trail and (if enabled) the novelty file |
 
 Requires Linux with kernel BTF (`/sys/kernel/btf/vmlinux`); runs as root because
 it loads eBPF and drives the cgroup freezer.
@@ -245,7 +245,7 @@ never skip it:
 ```sh
 systemctl status phage      # is it running?
 journalctl -u phage -f      # watch it, live
-phage status                # mode, uptime, events, alerts, contained; drops, events/s, lag, baseline sha256
+phage status                # mode, uptime, events, alerts, contained; drops, events/s, lag, baseline state and sha256
 phage events                # the recent verdicts, each with its reasons
 phage thaw <pid>            # manually release a contained process
 phage baseline show <file>  # what a baseline learned (read-only)
@@ -298,14 +298,16 @@ still load. Without `-config` the mode is learn and `-mode` cannot raise it.
 phaged fails closed on a full `/var` or a broken config — monitor
 `phage.service` restarts (see [FORK.md](FORK.md)).
 
-**Reporting.** In alert and enforce mode each verdict at or above the notify
-threshold is also written to `/var/lib/phage/novelty.jsonl` as a row of
-homelab-next's `novelty_finding` table (advisory, `source_kind: heuristic`),
-and an event whose kind was never seen while learning is written as
-`unlearned` instead of being silently scored 0. Set `output.tlp` (it defaults
-to `red`) and `output.entity`. Every minute, in every mode, a `heartbeat`
-audit record reports events/s, kernel ring-buffer drops, enrichment lag and
-the baseline's sha256. `deploy/wazuh/` has the decoder, rules and agent
+**Reporting.** Opt in with `output.novelty_path` (plus the required
+`output.tlp`, which may not be `red`, and `output.entity_kind`/`output.entity`,
+named as your lake profiles name this host): in alert and enforce mode each
+verdict at or above the notify threshold is then also written as a row of
+homelab-next's `novelty_finding` table (advisory, `source_kind: heuristic`), and
+once the baseline is ready an event whose kind was never seen while learning is
+written as `unlearned` instead of being silently scored 0; a flood becomes one
+`burst` row per profile per hour. Every minute, in every mode, a `heartbeat`
+audit record reports events/s, kernel ring-buffer drops, enrichment lag and the
+baseline's state and sha256. `deploy/wazuh/` has the decoder, rules and agent
 checks, including one for a heartbeat that stops; see
 [FORK.md](FORK.md#reporting-novelty-rows-heartbeat-baseline-review) and
 [docs/wazuh.md](docs/wazuh.md).
