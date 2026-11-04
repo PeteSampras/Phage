@@ -1,9 +1,14 @@
 package app
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AzozzALFiras/Phage/internal/agent/config"
+	"github.com/AzozzALFiras/Phage/internal/audit"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"github.com/AzozzALFiras/Phage/internal/response/action"
@@ -87,5 +92,47 @@ func TestGateDowngradesUnarmedRungs(t *testing.T) {
 		if got, _ := c.app.gate(c.in); got != c.want {
 			t.Errorf("%s: gate(%s) = %s, want %s", c.name, c.in, got, c.want)
 		}
+	}
+}
+
+func TestAnnounceEnforcementWritesAuditRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	aw, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := config.Default()
+	c.Mode = mode.Enforce
+	a := &App{cfg: c, audit: aw}
+	a.announceEnforcement([]string{config.FeatureIsolate, config.FeatureSelfHeal}, []string{config.FeatureSelfProtect})
+	aw.Close()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e audit.Entry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		t.Fatalf("audit line is not one JSON record: %v (%q)", err, raw)
+	}
+	if e.Kind != audit.KindEnforcementArmed || e.Mode != "enforce" {
+		t.Errorf("kind/mode = %q/%q, want enforcement_armed/enforce", e.Kind, e.Mode)
+	}
+	if strings.Join(e.Features, ",") != "isolate,self_heal" || strings.Join(e.Failed, ",") != "self_protect" {
+		t.Errorf("features=%v failed=%v", e.Features, e.Failed)
+	}
+}
+
+func TestAnnounceEnforcementSilentInAuditWhenNothingArmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	aw, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: config.Default(), audit: aw}
+	a.announceEnforcement(nil, nil)
+	aw.Close()
+	if raw, _ := os.ReadFile(path); len(raw) != 0 {
+		t.Errorf("no feature armed, but an audit record was written: %q", raw)
 	}
 }

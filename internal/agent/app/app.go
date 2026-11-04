@@ -136,15 +136,23 @@ func (a *App) Run(ctx context.Context) error {
 	// any other combination at startup, and Armed re-checks the mode here so a
 	// config that skipped Validate still cannot arm anything outside enforce.
 
+	// armed / failed collect what actually armed and what was requested but
+	// could not arm, for the single ENFORCEMENT ARMED line + audit record below.
+	var armed, failed []string
+
 	// Honeytokens: plant decoy credential files and alert on any read.
 	if a.cfg.Armed(config.FeatureHoneytokens) {
 		paths, inodes := honeytoken.Seed()
 		if len(inodes) == 0 {
 			log.Printf("honeytokens: none planted (decoy paths already exist?)")
+			failed = append(failed, config.FeatureHoneytokens)
 		} else if err := sensor.SetHoneytokens(inodes); err != nil {
 			log.Printf("honeytokens: %v", err)
+			honeytoken.Remove(paths)
+			failed = append(failed, config.FeatureHoneytokens)
 		} else {
 			defer honeytoken.Remove(paths)
+			armed = append(armed, config.FeatureHoneytokens)
 			log.Printf("honeytokens planted: %d decoys — any read of one is a high-confidence alert", len(paths))
 		}
 	}
@@ -154,13 +162,16 @@ func (a *App) Run(ctx context.Context) error {
 	if a.cfg.Armed(config.FeatureSelfProtect) {
 		if !selfprotect.Available() {
 			log.Printf("self-protection requested (enforcement.self_protect) but BPF LSM is not active; running without it")
+			failed = append(failed, config.FeatureSelfProtect)
 		} else {
 			objPath := filepath.Join(filepath.Dir(a.objPath), "selfprotect.bpf.o")
 			g, err := selfprotect.Arm(objPath, uint32(os.Getpid()), uint32(os.Getppid()))
 			if err != nil {
 				log.Printf("self-protection: %v; running without it", err)
+				failed = append(failed, config.FeatureSelfProtect)
 			} else {
 				defer g.Close()
+				armed = append(armed, config.FeatureSelfProtect)
 				log.Printf("self-protection ARMED: signals that would kill the agent are denied (except from pid 1 / launcher); systemctl stop and reboot still work")
 			}
 		}
@@ -173,10 +184,17 @@ func (a *App) Run(ctx context.Context) error {
 		nqObj := filepath.Join(filepath.Dir(a.objPath), "netquarantine.bpf.o")
 		if nq, err := netquarantine.New(nqObj); err != nil {
 			log.Printf("network quarantine unavailable: %v (egress verdicts will freeze if freeze is armed, else alert)", err)
+			failed = append(failed, config.FeatureIsolate)
 		} else {
 			a.netq = nq
 			defer nq.Close()
+			armed = append(armed, config.FeatureIsolate)
 		}
+	}
+
+	// Freeze has nothing to load: the cgroup freezer is driven on demand.
+	if a.cfg.Armed(config.FeatureFreeze) {
+		armed = append(armed, config.FeatureFreeze)
 	}
 
 	// Self-healing: snapshot the sentinel files now, restore them after a
@@ -185,11 +203,10 @@ func (a *App) Run(ctx context.Context) error {
 		a.healer = selfheal.New("/var/lib/phage/quarantine")
 		n := a.healer.SnapshotAll(selfheal.DefaultSentinels())
 		log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
+		armed = append(armed, config.FeatureSelfHeal)
 	}
 
-	if a.cfg.Mode == mode.Enforce && len(a.cfg.Enforcement.Requested()) == 0 {
-		log.Printf("mode=enforce but no enforcement feature is enabled in the config: verdicts alert only")
-	}
+	a.announceEnforcement(armed, failed)
 
 	log.Printf("sensors attached (creds, exec, egress, files, kernel-enabling ops, self-defense); mode=%s obj=%s", a.cfg.Mode, a.objPath)
 
@@ -346,7 +363,7 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
 
 	a.audit.Record(audit.Entry{
-		Action: string(want), Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
+		Kind: audit.KindResponse, Action: string(want), Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
 	})
 
 	// Actuate the chosen rung.
@@ -405,6 +422,40 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		a.recent = a.recent[len(a.recent)-a.recentLimit:]
 	}
 	a.mu.Unlock()
+}
+
+// announceEnforcement makes arming loud: one structured log line naming every
+// acting feature armed in this run (and any requested feature that failed to
+// arm), mirrored as an enforcement_armed audit record a SIEM can alert on. When
+// nothing armed it says so once, so "alert only" is explicit in the journal too.
+func (a *App) announceEnforcement(armed, failed []string) {
+	if len(armed) == 0 && len(failed) == 0 {
+		if a.cfg.Mode == mode.Enforce {
+			log.Printf("enforcement: mode=enforce but no enforcement feature is enabled in the config: verdicts alert only")
+		} else {
+			log.Printf("enforcement: none armed (mode=%s): detection and alerting only", a.cfg.Mode)
+		}
+		return
+	}
+	log.Printf("ENFORCEMENT ARMED event=enforcement_armed mode=%s features=%s failed=%s pid=%d",
+		a.cfg.Mode, joinOrNone(armed), joinOrNone(failed), os.Getpid())
+	a.audit.Record(audit.Entry{
+		Kind:     audit.KindEnforcementArmed,
+		Action:   audit.KindEnforcementArmed,
+		PID:      int32(os.Getpid()),
+		Comm:     "phaged",
+		Mode:     a.cfg.Mode.String(),
+		Features: armed,
+		Failed:   failed,
+		Reason:   fmt.Sprintf("acting features armed: %s; requested but not armed: %s", joinOrNone(armed), joinOrNone(failed)),
+	})
+}
+
+func joinOrNone(s []string) string {
+	if len(s) == 0 {
+		return "none"
+	}
+	return strings.Join(s, ",")
 }
 
 // gate maps the action the response matrix chose onto what the operator's

@@ -10,14 +10,24 @@ import (
 	"time"
 )
 
+// Event kinds an Entry can carry, so a SIEM can route on them.
+const (
+	KindResponse         = "response"          // a verdict and the action taken on it
+	KindEnforcementArmed = "enforcement_armed" // startup: acting features armed in this run
+)
+
 // Entry is one recorded action.
 type Entry struct {
-	Time   time.Time `json:"time"`
-	Action string    `json:"action"`
-	Score  float64   `json:"score"`
-	PID    int32     `json:"pid"`
-	Comm   string    `json:"comm"`
-	Reason string    `json:"reason"`
+	Time     time.Time `json:"time"`
+	Kind     string    `json:"kind,omitempty"`
+	Action   string    `json:"action"`
+	Score    float64   `json:"score"`
+	PID      int32     `json:"pid"`
+	Comm     string    `json:"comm"`
+	Reason   string    `json:"reason"`
+	Mode     string    `json:"mode,omitempty"`
+	Features []string  `json:"features,omitempty"` // enforcement_armed: features that armed
+	Failed   []string  `json:"failed,omitempty"`   // enforcement_armed: features requested but not armed
 }
 
 // Writer appends entries to a file. A nil *Writer is valid and discards writes,
