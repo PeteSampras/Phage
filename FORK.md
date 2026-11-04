@@ -183,22 +183,40 @@ docs moved together). `git log 9757354..` lists each commit.
    host's file. A mount-namespace comparison (the first fix) was wrong in the
    other direction: `unshare -Urm sh -c 'echo k >> ~/.ssh/authorized_keys'`
    is in a new namespace but still writes the host inode, so it was alerted
-   and never healed. *Fix:* the path is resolved inside the writer's root
-   (`/proc/<pid>/root`, `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`).
-   - If that is the host file's dev+ino, the heal runs.
-   - If it is a different file (the container's own copy), the host file is
-     not touched, and the response reason records the skip.
-   - If the writer has exited or its view cannot be read, the heal runs
-     **only if the writer could have written the host file**: its real uid in
-     the init namespace (from the kernel event) must be 0 or the sentinel's
-     owner. Then the host file's content decides; Heal does nothing if the
-     file is unchanged. Without the uid check (as in round 2), an unprivileged
-     user in `unshare -Urm` could put a tmpfs over the directory, write and
-     delete a private copy, and make the agent revert an admin's later edit,
-     e.g. reinstate a revoked key. The file sensor does not record euid/fsuid
-     for file events, so only the real uid can be checked; a setuid-root
-     writer started by a user is therefore not healed by this fallback, though
-     it is still alerted.
+   and never healed. Later rounds found that resolving the writer's view is
+   **not sufficient on its own**:
+   - An unprivileged user can write a private copy and then `rm` it, so the
+     view no longer resolves (fixed in round 3).
+   - The same user can write a private copy and then `umount` its tmpfs, so
+     the view resolves to the *host* inode again (round 4).
+   - The gate compared the writer with the *snapshot* owner, not the current
+     one (round 4).
+
+   *Fix (current):* the gate has two conditions, both required.
+   - **The writer could have written the host file.** Its real uid in the
+     init namespace is 0 or the file's **current** owner, read at decision
+     time through the verified directory (the directory's owner if the file
+     is absent). This is checked first, on every branch.
+   - **The writer's view does not name a different file.** The path, resolved
+     in `/proc/<pid>/root` with `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`,
+     must be the host file's dev+ino. A container's own copy is never healed
+     over the host file, even for root. If the view cannot be resolved, the
+     uid condition alone decides, and Heal then compares the host file with
+     its snapshot.
+
+   In addition, **Heal refuses (audited `failed:`) if the file's current owner
+   differs from its snapshot owner**, so it never hands a file back to an old
+   owner.
+
+   This narrows who can trigger a wrong heal; it does not make self-heal safe:
+   - Only real uids are checked; the sensor records no euid/fsuid for file
+     events, so a setuid-root writer started by a user is not healed.
+   - **Container root without a user-namespace remap is real uid 0 and counts
+     as root.** It can make the agent revert a host sentinel to its startup
+     snapshot, even if it cannot write that file, by writing and removing a
+     private copy at the same path.
+   - The file's current owner can revert an admin's edit to their own file,
+     but gains nothing they could not do directly.
 
    Write-open events that arrive during a running heal set a dirty bit, so
    the heal runs once more rather than missing them. Every heal attempt is
@@ -277,23 +295,31 @@ mean to use it by hand.
   the kernel's `dev_t` encoding. The objects compile here (clang, libbpf 1.3,
   vmlinux.h from `bpftool btf dump`), but this sandbox refuses BPF loads
   (EPERM), so the change could not be verified and was not made.
-- **N1: a writer holding an open fd can defeat the self-heal gate.** The gate
-  resolves the path in the writer's root *when the event is handled*. A writer
-  can open the host file, then over-mount its own view (`unshare -Urm`, tmpfs
-  over the directory) and create a private file at the same path. The gate
-  then sees "a different file" and skips the heal, while the attacker's data
-  sits in the host file through the fd it already holds. The alert still
-  fires. The fix is for the sensor to record the dev+ino of the opened inode
-  (`file->f_inode`) and compare that with the host file, which needs a BPF
-  change. This is why self-heal should stay off (see the recommendation at
-  the top).
+- **N1: the gate inspects the writer's view later, not the opened inode.**
+  It resolves the path in the writer's root *when the event is handled*, so
+  what it sees can differ from what was opened.
+  - **Missed heal.** A writer with the right uid (root, or the file's owner)
+    can open the host file, then over-mount its own view and create a private
+    file at the same path. The gate then sees "a different file" and skips the
+    heal, while the attacker's data sits in the host file through the fd it
+    already holds. The alert still fires.
+  - **Wrong heal.** The reverse trick (write a private copy, then unmount or
+    remove it) can still cause a wrong heal, but since round 4 only for a
+    writer whose uid is root (including container root without a userns
+    remap) or the file's current owner. Unprivileged non-owners are refused
+    on every branch.
+
+  Both disappear once the sensor records the dev+ino of the opened inode
+  (`file->f_inode`), and the euid/fsuid, in-kernel. That needs a BPF change,
+  and it is why self-heal should stay off (see the recommendation at the
+  top).
 - **N2: the sensor reports write-opens, not writes.** An event is an `open`
   with write intent. Data written later through an fd opened earlier, before
   the heal ran or after it, raises no new event and is never healed. The
   write-open itself is alerted. Closing this needs write-path or close-time
   hooks in-kernel.
 - **Self-heal for a writer that has already exited** heals only for a root or
-  file-owner uid, and then lets the host file's content decide. A host edit
+  current-owner uid, and then lets the host file's content decide. A host edit
   that scored below `contain`, followed by a high-scoring write-open from such
   a writer, is reverted along with the attacker's write (see the next item).
   Recording the opened inode and the euid/fsuid in-kernel would remove this.

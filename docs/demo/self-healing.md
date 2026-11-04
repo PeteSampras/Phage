@@ -43,25 +43,43 @@ component is a symlink, the parent directory was swapped since the snapshot,
 the parent is owned by neither root nor the file's owner, or the target is now
 a directory.
 
-**Whose file was written?** The event's path is resolved in the *writer's* view
-of the filesystem, which may not be the host's (a container, or `unshare -m`).
-Comparing mount namespaces is the wrong test — `unshare -Urm sh -c 'echo k >>
-~/.ssh/authorized_keys'` is in a new namespace but still writes the host inode.
-So the agent resolves the path inside the writer's root (`/proc/<pid>/root`,
-`openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`) and heals when that is the host
-file's dev+ino. If it is a *different* file (a container's private copy), the
-host file is not touched and the alert notes the skip.
+**Who may trigger a heal, and of which file?** The event's path is resolved in
+the *writer's* view of the filesystem, which may not be the host's (a
+container, or `unshare -m`), and the view can change between the write-open
+and the moment the agent looks at it. The gate therefore has two conditions,
+both required:
 
-If the writer's view cannot be checked — it has exited, or it removed its
-private copy — the agent heals **only if that writer could have written the
-host file at all**: its real uid in the init namespace (from the kernel event)
-must be 0 or the sentinel's owner. Otherwise an unprivileged user could write
-and delete a private copy in its own namespace and make the agent revert an
-admin's later edit of the host file, for example reinstating a revoked key.
-When the fallback does heal, the host file's content decides: it is compared
-with the snapshot and left alone if unchanged. The sensor does not capture
-euid/fsuid for file events, so a setuid-root writer run by a user is not healed
-by this fallback; it is still alerted.
+1. **The writer could have written the host file**: its real uid in the init
+   namespace (from the kernel event) is 0 or the host file's **current**
+   owner, read at decision time through the verified directory (the directory's
+   owner if the file is absent). This is checked first, on every path. Without
+   it, an unprivileged user in its own user+mount namespace can put a tmpfs
+   over the directory, write a private copy (that is the event), then `rm` it
+   or `umount` the tmpfs so its view resolves to the host inode again, and make
+   the agent revert an admin's later edit of a root-owned file, for example
+   reinstating a revoked key. The snapshot owner is not used here, because
+   ownership can change after the snapshot.
+2. **The writer's view does not name a different file**: the path, resolved
+   inside `/proc/<pid>/root` with `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`,
+   must be the host file's dev+ino. A container's own copy is never healed
+   over the host file, even for root. If the view cannot be resolved (the
+   writer exited, or removed its copy), condition 1 alone decides. Heal then
+   compares the host file with its snapshot and leaves it alone if unchanged.
+
+Heal also refuses, and audits the refusal, if the file's current owner differs
+from its owner at snapshot time: it never hands a file back to an old owner.
+
+What this does **not** give you:
+- The real uid is the only writer identity the sensor records for file
+  events. euid/fsuid are not captured, so a setuid-root writer started by a
+  user is not healed (it is still alerted).
+- **Container root without a user-namespace remap is real uid 0 and counts as
+  root.** It can trigger a revert of a host sentinel to its startup snapshot,
+  even where it cannot write that file, by writing and removing a private copy
+  at the same path.
+- The current owner of a file (or root) can trigger a revert of an admin's
+  edit to that file, e.g. to their own `authorized_keys`. They could edit the
+  file directly anyway, so no privilege is gained.
 
 A burst of write-open events costs at most one extra heal: an event that
 arrives while a heal is running marks the file dirty and the heal runs once
