@@ -269,7 +269,12 @@ func sharedDirFx(t *testing.T, dirMode os.FileMode) attackFx {
 	if err := h.Snapshot(target); err != nil {
 		t.Fatal(err)
 	}
-	os.Chmod(dir, dirMode)
+	if err := os.Chmod(dir, dirMode); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode()&(os.ModePerm|os.ModeSticky) != dirMode {
+		t.Fatalf("setup: dir mode %v, want %v", fi.Mode(), dirMode)
+	}
 	cfg := config.Default()
 	cfg.Mode, cfg.Enforcement = mode.Enforce, config.Enforcement{SelfHeal: true}
 	a, path := appWithAudit(t, cfg, Meta{})
@@ -303,7 +308,7 @@ func TestAttackSharedDirReplaceThenDelete(t *testing.T) {
 // R4: sticky (/tmp-like) directory; the admin removed the sentinel; the
 // attacker recreates it, then deletes it during the heal delay.
 func TestAttackStickyDirRecreateDeleted(t *testing.T) {
-	f := sharedDirFx(t, 0o1777)
+	f := sharedDirFx(t, 0o777|os.ModeSticky)
 	os.Remove(f.target)
 	asAttacker(t, "echo x > "+f.target)
 	f.fire(999999, attackerUID)
@@ -320,4 +325,44 @@ func TestAttackOwnerDeletesDuringHeal(t *testing.T) {
 	f.a.healDelay = func() { asAttacker(t, "rm -f "+f.target) }
 	f.fire(pid, attackerUID)
 	mustNotBeRecreated(t, f)
+}
+
+// The dirty-bit rerun must heal with the uid of the writer whose event was
+// folded in, not the first writer's. A root event's heal is in flight; the
+// owner (uid 4242) writes and her event is folded into the rerun; before the
+// rerun she deletes the file. The rerun runs for uid 4242, so the absent file
+// must not be recreated (it would be if the rerun kept root's uid).
+func TestRerunUsesFoldedInWriterUID(t *testing.T) {
+	f := newAttackFx(t, attackerUID)  // alice-owned sentinel in her own 0700 dir
+	alice := spawnAttacker(t, "true") // a live writer whose view is the host's
+	release := make(chan struct{})
+	calls := 0
+	f.a.healDelay = func() {
+		calls++
+		switch calls {
+		case 1:
+			<-release // root's heal waits until alice's event is folded in
+		case 2:
+			asAttacker(t, "rm -f "+f.target) // before the rerun, alice deletes the file
+		}
+	}
+	os.WriteFile(f.target, []byte("evil-by-root\n"), 0o600)
+	f.a.respond(model.Event{Kind: kind.FileWrite, PID: 999999, PPID: 1, Comm: "sh",
+		Creds: model.Credentials{UID: 0}, File: model.FileWrite{Path: f.target}},
+		verdict.Verdict{Score: 0.95}, action.Notify)
+	asAttacker(t, "echo alice-write > "+f.target)
+	f.a.respond(model.Event{Kind: kind.FileWrite, PID: alice, PPID: 1, Comm: "sh",
+		Creds: model.Credentials{UID: attackerUID}, File: model.FileWrite{Path: f.target}},
+		verdict.Verdict{Score: 0.95}, action.Notify)
+	close(release)
+	f.a.healWG.Wait()
+
+	if calls != 2 {
+		t.Fatalf("heal ran %d times, want 2 (root's heal + one rerun for the folded-in event)", calls)
+	}
+	mustNotBeRecreated(t, f)
+	recs := recordsOfKind(t, f.audit, "self_heal")
+	if len(recs) != 2 || recs[0].Outcome != "healed" || !strings.HasPrefix(recs[1].Outcome, "failed:") {
+		t.Fatalf("self_heal records = %+v, want healed then failed:<absent, non-root writer>", recs)
+	}
 }

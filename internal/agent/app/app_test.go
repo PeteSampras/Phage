@@ -194,6 +194,13 @@ func TestWriterSeesHostFile(t *testing.T) {
 			}
 		}
 	}
+	// An absent file (currentOwner -1) has no owner: only root may cause it to
+	// be recreated, on every branch.
+	for _, pid := range []int32{800, 802, 31337} {
+		if ok, _ := writerSeesHostFile(testProc, pid, host, user, -1); ok {
+			t.Errorf("pid %d: uid %d admitted for an absent file (owner -1)", pid, user)
+		}
+	}
 	if ok, _ := writerSeesHostFile(testProc, 801, host, root, root); ok {
 		t.Error("a writer whose path resolves to a different file must not trigger a host heal, even as root")
 	}

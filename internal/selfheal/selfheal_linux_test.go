@@ -564,11 +564,16 @@ func TestCurrentOwner(t *testing.T) {
 // watched: another user can replace or remove them between any check and the
 // restore.
 func TestSnapshotRefusesSharedDirectory(t *testing.T) {
-	for _, m := range []os.FileMode{0o777, 0o770, 0o1777, 0o1770} {
+	for _, m := range []os.FileMode{0o777, 0o770, 0o777 | os.ModeSticky, 0o770 | os.ModeSticky} {
 		f := newFixture(t)
-		os.Chmod(f.sshDir, m)
+		if err := os.Chmod(f.sshDir, m); err != nil {
+			t.Fatal(err)
+		}
+		if fi, _ := os.Stat(f.sshDir); fi.Mode()&(os.ModePerm|os.ModeSticky) != m {
+			t.Fatalf("setup: dir mode %v, want %v", fi.Mode(), m)
+		}
 		if err := f.store.Snapshot(f.target); !errors.Is(err, ErrUnsafe) {
-			t.Errorf("dir mode %o: Snapshot err = %v, want ErrUnsafe", m, err)
+			t.Errorf("dir mode %v: Snapshot err = %v, want ErrUnsafe", m, err)
 		}
 	}
 }
@@ -578,7 +583,10 @@ func TestHealRefusesDirectoryMadeSharedLater(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
 	writeFile(t, f.target, "evil\n", 0o640)
-	os.Chmod(f.sshDir, 0o1777)
+	os.Chmod(f.sshDir, 0o777|os.ModeSticky)
+	if fi, _ := os.Stat(f.sshDir); fi.Mode()&os.ModeSticky == 0 {
+		t.Fatal("setup: sticky bit not set")
+	}
 	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal in a now world-writable dir: err = %v, want ErrUnsafe", err)
 	}
