@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/AzozzALFiras/Phage/internal/control"
+	"github.com/AzozzALFiras/Phage/internal/logsafe"
 )
 
 var version = "dev"
@@ -59,8 +60,10 @@ func cmdEvents(sock string, rest []string) {
 		return
 	}
 	for _, a := range resp.Alerts {
-		fmt.Printf("%s  score=%.2f  requested=%s action=%s outcome=%q pid=%d comm=%q :: %q\n",
-			a.Time, a.Score, a.Requested, a.Action, a.Outcome, a.PID, a.Comm, a.Reason)
+		// Reason and outcome carry attacker-chosen paths/names: escape them once
+		// (logsafe.Clean) so they cannot inject lines or terminal sequences.
+		fmt.Printf("%s  score=%.2f  requested=%s action=%s outcome=%s pid=%d comm=%q :: %s\n",
+			a.Time, a.Score, a.Requested, a.Action, logsafe.Clean(a.Outcome), a.PID, a.Comm, logsafe.Clean(a.Reason))
 	}
 }
 

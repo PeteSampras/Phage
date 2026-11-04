@@ -339,6 +339,10 @@ func TestRespondLogCannotBeLineForged(t *testing.T) {
 	if !strings.Contains(out, `\nCRITICAL self-defense`) {
 		t.Errorf("the newline in the path should appear escaped: %s", out)
 	}
+	// Escaped exactly once: no quoted-inside-quoted path.
+	if !strings.Contains(out, `(wrote /etc/cron.d/a\nCRITICAL self-defense: forged line)`) || strings.Contains(out, `\\n`) {
+		t.Errorf("the path should be escaped once, not double-quoted: %s", out)
+	}
 }
 
 type fakeFreezer struct{ frozen []int32 }

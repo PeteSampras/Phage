@@ -27,6 +27,7 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/event/kind"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/honeytoken"
+	"github.com/AzozzALFiras/Phage/internal/logsafe"
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"github.com/AzozzALFiras/Phage/internal/policy/response"
 	"github.com/AzozzALFiras/Phage/internal/response/action"
@@ -317,10 +318,10 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	// first question; keep it in the reason and the audit trail even though the
 	// learned feature is the coarse class, not the path.
 	if ev.Kind == kind.FileWrite && ev.File.Path != "" {
-		reason = fmt.Sprintf("%s (wrote %q)", reason, ev.File.Path)
+		reason = fmt.Sprintf("%s (wrote %s)", reason, ev.File.Path)
 	}
 	if ev.Kind == kind.Enable && ev.EnableOp != "" {
-		reason = fmt.Sprintf("%s (op: %q)", reason, ev.EnableOp)
+		reason = fmt.Sprintf("%s (op: %s)", reason, ev.EnableOp)
 	}
 
 	applied, outcome := a.actuate(ev, requested)
@@ -345,11 +346,12 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 
 	// Logged and audited AFTER actuation, so the trail says what was asked
 	// for, what was done, and how it went. Every attacker-influenced string is
-	// printed with %q, so a crafted name holding a newline or control bytes
+	// escaped exactly once here (comm/parent with %q, the free-text reason and
+	// outcome with logsafe.Clean), so a crafted name holding a newline or control bytes
 	// cannot forge an extra journal line.
-	log.Printf("%s score=%.2f requested=%s action=%s outcome=%q pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=%q",
-		strings.ToUpper(labelFor(v.Score)), v.Score, requested, applied, outcome,
-		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, reason)
+	log.Printf("%s score=%.2f requested=%s action=%s outcome=\"%s\" pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=\"%s\"",
+		strings.ToUpper(labelFor(v.Score)), v.Score, requested, applied, logsafe.Clean(outcome),
+		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, logsafe.Clean(reason))
 	if err := a.audit.Record(audit.Entry{
 		Kind: audit.KindResponse, Requested: string(requested), Action: string(applied), Outcome: outcome,
 		Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
@@ -725,7 +727,7 @@ func (a *App) respondSelfDefense(ev model.Event) {
 	if ev.SelfDefOp != "ptrace" && a.isSupervisor(ev.PID) {
 		return // legitimate service stop by the supervisor
 	}
-	detail := fmt.Sprintf("attempt to tamper with the Phage agent: %s by %q (pid %d) — monitor blinding/kill attempt",
+	detail := fmt.Sprintf("attempt to tamper with the Phage agent: %s by %s (pid %d) — monitor blinding/kill attempt",
 		ev.SelfDefOp, ev.Comm, ev.PID)
 	v := verdict.Verdict{
 		Score:   1.0,
@@ -743,7 +745,7 @@ func (a *App) respondHoneytoken(ev model.Event) {
 	if a.isSelf(ev.PID) {
 		return
 	}
-	detail := fmt.Sprintf("read a planted honeytoken decoy %q — near-certain credential theft / intruder snooping", ev.File.Path)
+	detail := fmt.Sprintf("read a planted honeytoken decoy %s — near-certain credential theft / intruder snooping", ev.File.Path)
 	v := verdict.Verdict{
 		Score:   1.0,
 		Reasons: []verdict.Reason{{Feature: "honeytoken", Contribution: 1.0, Detail: detail}},
