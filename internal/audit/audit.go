@@ -64,8 +64,10 @@ type Writer struct {
 }
 
 // Open returns a Writer appending to path, created 0600. The final component
-// is opened O_NOFOLLOW so a planted symlink cannot redirect root's appends, and
-// a pre-existing file with looser permissions is tightened. An empty path
+// is opened O_NOFOLLOW so a planted symlink cannot redirect root's appends,
+// O_NONBLOCK so a FIFO planted there fails instead of hanging startup, only a
+// regular file is accepted, and a pre-existing file with looser permissions is
+// tightened. An empty path
 // disables auditing (nil *Writer).
 func Open(path string) (*Writer, error) {
 	if path == "" {
@@ -74,9 +76,23 @@ func Open(path string) (*Writer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("audit trail directory: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	const flags = os.O_WRONLY | os.O_APPEND | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
+	// A new trail is created 0600 exclusively, so its mode comes from the
+	// create alone; only a pre-existing trail is vetted and tightened.
+	f, err := os.OpenFile(path, flags|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		f, err = openExisting(path, flags)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open audit trail %q: %w", path, err)
+	}
+	return &Writer{f: f}, nil
+}
+
+func openExisting(path string, flags int) (*os.File, error) {
+	f, err := os.OpenFile(path, flags, 0)
+	if err != nil {
+		return nil, err
 	}
 	fi, err := f.Stat()
 	if err != nil {
@@ -85,15 +101,15 @@ func Open(path string) (*Writer, error) {
 	}
 	if !fi.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("audit trail %q is not a regular file", path)
+		return nil, errors.New("not a regular file")
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		if err := f.Chmod(0o600); err != nil {
 			f.Close()
-			return nil, fmt.Errorf("tighten audit trail %q to 0600: %w", path, err)
+			return nil, fmt.Errorf("tighten to 0600: %w", err)
 		}
 	}
-	return &Writer{f: f}, nil
+	return f, nil
 }
 
 // ErrDisabled is returned by Record on a nil Writer.
