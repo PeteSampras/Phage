@@ -410,3 +410,20 @@ func captureLog(t *testing.T) *syncBuffer {
 	t.Cleanup(func() { log.SetOutput(prev); log.SetFlags(prevFlags) })
 	return buf
 }
+
+// deploy/wazuh's startup rules read the status from the end of the reason
+// (status is a Wazuh static field name), so the format is a contract.
+func TestStartupReasonEndsWithStatus(t *testing.T) {
+	for status, armed := range map[string][]string{audit.StatusNone: nil, audit.StatusArmed: {config.FeatureFreeze}} {
+		c := config.Default()
+		c.Mode = mode.Enforce
+		a, path := appWithAudit(t, c, Meta{})
+		if err := a.announceStartup(armed, nil); err != nil {
+			t.Fatal(err)
+		}
+		recs := recordsOfKind(t, path, audit.KindStartup)
+		if len(recs) != 1 || !strings.HasSuffix(recs[0].Reason, " status="+status) {
+			t.Errorf("startup reason %q must end with status=%s", recs[0].Reason, status)
+		}
+	}
+}

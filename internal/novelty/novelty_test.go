@@ -95,6 +95,9 @@ func TestUnlearnedRowHasNoScore(t *testing.T) {
 	if *r.EntityTotal != 0 || r.Value != "192.0.2.7:4444" || r.Profile != "connect" {
 		t.Errorf("row = %+v", r)
 	}
+	if !strings.HasSuffix(r.Message, "(unlearned)") {
+		t.Errorf("message %q: deploy/wazuh rule 100832 matches the (unlearned) suffix", r.Message)
+	}
 	if r.Reasons[0] != "no observations in the baseline for net.a, net.b" {
 		t.Errorf("reasons = %q", r.Reasons)
 	}

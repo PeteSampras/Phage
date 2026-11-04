@@ -1,0 +1,50 @@
+#!/bin/sh
+# phage-heartbeat-check — agent-side "is phaged still reporting?" check for
+# Wazuh (deploy/wazuh/, docs/wazuh.md).
+#
+# Wazuh rules fire on events that arrive; no rule can fire because an event
+# did NOT arrive. So the absence of phaged's heartbeat is turned into an
+# event here: the Wazuh agent runs this every minute (a `command` localfile)
+# and it prints exactly one line, which the phage rules match:
+#
+#   status=fresh age=<s> max=<s>      the last heartbeat is recent enough
+#   status=stale age=<s> max=<s>      no heartbeat for longer than max seconds
+#   status=missing reason=<why> ...   no audit trail, or no heartbeat in it
+#
+# usage: phage-heartbeat-check [max_age_seconds] [audit_trail]
+#   max_age_seconds  default 180 (three default 60 s heartbeat intervals)
+#   audit_trail      default /var/lib/phage/audit.jsonl
+#
+# Read-only. Needs GNU date and tac, and read access to the trail (0600 root;
+# the Wazuh agent's logcollector runs as root).
+max=${1:-180}
+trail=${2:-/var/lib/phage/audit.jsonl}
+
+case $max in
+'' | *[!0-9]*)
+	echo "status=missing reason=bad-max-age max=$max"
+	exit 0
+	;;
+esac
+if [ ! -r "$trail" ]; then
+	echo "status=missing reason=no-audit-trail max=$max"
+	exit 0
+fi
+# A heartbeat record starts {"time":"<RFC 3339>","kind":"heartbeat" (the
+# field order is fixed by phaged). The anchored match cannot be fooled by text
+# inside another record: JSON escapes every quote within a string.
+last=$(tac "$trail" | grep -m 1 '^{"time":"[^"]*","kind":"heartbeat"' | cut -d '"' -f 4)
+if [ -z "$last" ]; then
+	echo "status=missing reason=no-heartbeat max=$max"
+	exit 0
+fi
+if ! then=$(date -d "$last" +%s 2>/dev/null); then
+	echo "status=missing reason=unparsable-time max=$max"
+	exit 0
+fi
+age=$(($(date +%s) - then))
+if [ "$age" -gt "$max" ]; then
+	echo "status=stale age=$age max=$max"
+else
+	echo "status=fresh age=$age max=$max"
+fi

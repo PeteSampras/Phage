@@ -1,0 +1,196 @@
+<!--
+  Phage rules for the Wazuh manager (copy to /var/ossec/etc/rules/).
+  Needs Wazuh 4.3 or later (PCRE2 field matching). Rule ids 100800-100849.
+  See docs/wazuh.md for the agent side, the levels and how to test them.
+
+  Streams (agent_ossec.conf ships them with log_format json):
+    /var/lib/phage/audit.jsonl    phaged's audit trail: startup, enforcement_armed,
+                                  disarmed, response, self_heal, heartbeat
+    /var/lib/phage/novelty.jsonl  novelty_finding rows (advisory, source_kind heuristic)
+  plus two agent-side command checks: the heartbeat's age and phage.service's state.
+
+  `status` and `action` are Wazuh static field names: the JSON decoder may
+  store those keys as static fields, which <field name=...> does not see. So
+  no rule here matches them. A startup record's status is read from its
+  reason ("... status=armed"), and a novelty row is a finding when it has a
+  score and unlearned when its message ends "(unlearned)".
+-->
+<group name="phage,">
+
+  <!-- ===== Audit trail ===================================================== -->
+
+  <rule id="100800" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="kind" type="pcre2">^(startup|enforcement_armed|disarmed|response|self_heal|heartbeat)$</field>
+    <field name="pid" type="pcre2">^-?\d+$</field>
+    <field name="reason" type="pcre2">\S</field>
+    <description>Phage: audit record ($(kind)).</description>
+  </rule>
+
+  <!-- Startup: every start writes one. Alert on anything armed or failed. -->
+  <rule id="100801" level="3">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^startup$</field>
+    <field name="reason" type="pcre2">status=none$</field>
+    <description>Phage: phaged started in $(mode) mode; nothing host-modifying armed.</description>
+    <group>phage_startup,</group>
+  </rule>
+
+  <rule id="100802" level="10">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^startup$</field>
+    <field name="reason" type="pcre2">status=armed$</field>
+    <description>Phage: phaged started with host-modifying features ARMED ($(mode) mode).</description>
+    <group>phage_startup,</group>
+  </rule>
+
+  <rule id="100803" level="8">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^startup$</field>
+    <field name="reason" type="pcre2">status=failed$</field>
+    <description>Phage: phaged started; host-modifying features were requested but none armed.</description>
+    <group>phage_startup,</group>
+  </rule>
+
+  <!-- A start loop: three starts within ten minutes (Restart=on-failure). -->
+  <rule id="100804" level="12" frequency="3" timeframe="600">
+    <if_matched_group>phage_startup</if_matched_group>
+    <same_location />
+    <description>Phage: phaged restarted 3 times in 10 minutes (crash loop; the host is mostly unmonitored).</description>
+  </rule>
+
+  <rule id="100805" level="10">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^enforcement_armed$</field>
+    <description>Phage: ENFORCEMENT ARMED ($(reason)).</description>
+  </rule>
+
+  <rule id="100806" level="9">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^disarmed$</field>
+    <description>Phage: started with a -mode downgrade that disarmed features ($(reason)).</description>
+  </rule>
+
+  <!-- Responses: one per verdict at or above the notify threshold (and every
+       attack on the agent or read of a decoy, in any mode). -->
+  <rule id="100810" level="8">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^response$</field>
+    <description>Phage: anomaly (score $(score)) by $(comm) pid $(pid): $(outcome).</description>
+  </rule>
+
+  <rule id="100811" level="12">
+    <if_sid>100810</if_sid>
+    <field name="outcome" type="pcre2">^contained$</field>
+    <description>Phage: CONTAINED $(comm) pid $(pid).</description>
+  </rule>
+
+  <rule id="100812" level="10">
+    <if_sid>100810</if_sid>
+    <field name="outcome" type="pcre2">^failed:</field>
+    <description>Phage: response FAILED for $(comm) pid $(pid): $(outcome).</description>
+  </rule>
+
+  <rule id="100813" level="11">
+    <if_sid>100810</if_sid>
+    <field name="score" type="pcre2">^(0\.[89]\d*|1(\.0+)?)$</field>
+    <description>Phage: high-confidence anomaly (score $(score)) by $(comm) pid $(pid).</description>
+  </rule>
+
+  <!-- Self-heal attempts (only with enforcement.self_heal armed). -->
+  <rule id="100815" level="10">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^self_heal$</field>
+    <field name="outcome" type="pcre2">^healed$</field>
+    <description>Phage: self-healed $(path) (tampered copy kept as evidence).</description>
+  </rule>
+
+  <rule id="100816" level="10">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^self_heal$</field>
+    <field name="outcome" type="pcre2">^failed:</field>
+    <description>Phage: self-heal of $(path) failed: $(outcome).</description>
+  </rule>
+
+  <rule id="100817" level="3">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^self_heal$</field>
+    <field name="outcome" type="pcre2">^unchanged$</field>
+    <description>Phage: self-heal of $(path): nothing to restore.</description>
+  </rule>
+
+  <!-- Heartbeat: every output.heartbeat_interval seconds, in every mode. -->
+  <rule id="100820" level="0">
+    <if_sid>100800</if_sid>
+    <field name="kind" type="pcre2">^heartbeat$</field>
+    <description>Phage: heartbeat ($(health.events_per_sec) events/s).</description>
+  </rule>
+
+  <rule id="100821" level="10">
+    <if_sid>100820</if_sid>
+    <field name="health.drops" type="pcre2">^[1-9]</field>
+    <description>Phage: $(health.drops) kernel event(s) dropped in the last interval (ring buffer full; detection incomplete).</description>
+  </rule>
+
+  <rule id="100822" level="9">
+    <if_sid>100820</if_sid>
+    <field name="health.novelty_errors" type="pcre2">^[1-9]</field>
+    <description>Phage: $(health.novelty_errors) novelty row(s) could not be written.</description>
+  </rule>
+
+  <rule id="100823" level="7" ignore="3600">
+    <if_sid>100820</if_sid>
+    <field name="health.drops_error" type="pcre2">\S</field>
+    <description>Phage: the ring-buffer drop counter cannot be read ($(health.drops_error)).</description>
+  </rule>
+
+  <rule id="100824" level="7" ignore="3600">
+    <if_sid>100820</if_sid>
+    <field name="health.checkpoint_errors" type="pcre2">^[1-9]</field>
+    <description>Phage: baseline checkpoints have failed ($(health.checkpoint_errors) since start).</description>
+  </rule>
+
+  <!-- ===== Novelty rows ==================================================== -->
+  <!-- Advisory (ADR-0036): a finding row repeats a response record that
+       already alerts (100810), so it is kept at level 3; an unlearned row has
+       no response record, so it alerts on its own. -->
+
+  <rule id="100830" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="source_kind" type="pcre2">^heuristic$</field>
+    <field name="uid" type="pcre2">^phage-[0-9a-f]+$</field>
+    <description>Phage: novelty row.</description>
+  </rule>
+
+  <rule id="100831" level="3">
+    <if_sid>100830</if_sid>
+    <field name="score" type="pcre2">^\d</field>
+    <description>Phage novelty: $(profile) $(value) on $(entity_kind):$(entity), score $(score) (advisory).</description>
+  </rule>
+
+  <rule id="100832" level="6">
+    <if_sid>100830</if_sid>
+    <field name="message" type="pcre2">\(unlearned\)$</field>
+    <description>Phage novelty: $(profile) $(value) on $(entity_kind):$(entity) was never seen while learning (unlearned, advisory).</description>
+  </rule>
+
+  <!-- ===== Agent-side checks (command localfiles) ========================= -->
+  <!-- Rule 530 is Wazuh's own "ossec: output:" rule for command output. -->
+
+  <!-- The heartbeat went missing: no rule can fire on an absent event, so the
+       agent runs phage-heartbeat-check every minute and reports the age. -->
+  <rule id="100840" level="12">
+    <if_sid>530</if_sid>
+    <match>^ossec: output: 'phage-heartbeat': </match>
+    <regex type="pcre2">status=(stale|missing)</regex>
+    <description>Phage: no heartbeat for 3 intervals (phaged stopped, wedged, or its audit trail is not being written).</description>
+  </rule>
+
+  <rule id="100841" level="12">
+    <if_sid>530</if_sid>
+    <match>^ossec: output: 'phage-service': </match>
+    <regex type="pcre2">': (inactive|failed|activating|deactivating|reloading|unknown)\s*$</regex>
+    <description>Phage: phage.service is not active.</description>
+  </rule>
+
+</group>

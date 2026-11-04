@@ -1,0 +1,23 @@
+<!--
+  Phage decoders for the Wazuh manager (copy to /var/ossec/etc/decoders/).
+
+  phaged's audit trail and novelty file are JSON lines. Wazuh's built-in
+  `json` decoder already decodes them into fields (nested objects flatten to
+  dotted names, e.g. health.drops), and a second root decoder for JSON lines
+  would never be reached: root decoders are tried in load order and the
+  built-in one matches first. So the JSON needs no decoder of its own; the
+  rules in phage_rules.xml match `decoded_as json` plus Phage's own fields.
+
+  The decoder below only names the fields of the two agent-side checks (the
+  `command` localfiles in agent_ossec.conf), whose lines arrive as
+    ossec: output: 'phage-heartbeat': status=stale age=412 max=180
+    ossec: output: 'phage-service': inactive
+  It is a convenience for searching; the rules match the raw line and do not
+  depend on it.
+-->
+<decoder name="phage-check">
+  <parent>ossec</parent>
+  <prematch>^ossec: output: 'phage-</prematch>
+  <regex type="pcre2">^ossec: output: 'phage-(heartbeat|service)': (?:status=)?(\S+)</regex>
+  <order>phage_check, phage_status</order>
+</decoder>
