@@ -84,6 +84,9 @@ func TestEventDecodesFields(t *testing.T) {
 	if ev.ParentComm != "sh" {
 		t.Errorf("ParentComm = %q, want %q", ev.ParentComm, "sh")
 	}
+	if ev.KernelNs != 1234 {
+		t.Errorf("KernelNs = %d, want ts_ns 1234 (the enrichment lag is measured from it)", ev.KernelNs)
+	}
 	if ev.Kind != kind.CredsChange {
 		t.Errorf("Kind = %q, want %q", ev.Kind, kind.CredsChange)
 	}

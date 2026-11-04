@@ -28,6 +28,7 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/honeytoken"
 	"github.com/AzozzALFiras/Phage/internal/logsafe"
+	"github.com/AzozzALFiras/Phage/internal/novelty"
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"github.com/AzozzALFiras/Phage/internal/policy/response"
 	"github.com/AzozzALFiras/Phage/internal/response/action"
@@ -57,6 +58,28 @@ type App struct {
 	netq          isolator // nil unless isolate armed and loaded
 	healer        *selfheal.Store
 	audit         *audit.Writer
+	armed         []string // host-modifying features that armed (startup and heartbeat records)
+
+	// Novelty output (alert and enforce): rows go through the emitter, which
+	// dedupes per uid bucket, to the sink (nil when output.novelty_path is
+	// empty). ident names this sensor and host in every row.
+	novelty   *novelty.Emitter
+	sink      *novelty.Sink
+	ident     novelty.Identity
+	hostname  func() (string, error)
+	overflown map[string]bool // feature keys whose cap overflow was logged (event loop only)
+
+	// Sensor health, for the heartbeat and phage status. drops reads the
+	// kernel's ring-buffer drop counter (nil until the sensor loads); monoNow
+	// reads CLOCK_MONOTONIC, the clock of the kernel's event timestamps.
+	drops   func() (uint64, error)
+	monoNow func() (uint64, bool)
+	hb      heartbeatState
+
+	// Baseline persistence: one save at a time (checkpoint or shutdown);
+	// savedGen is the profile generation last saved.
+	saveMu   sync.Mutex
+	savedGen uint64
 
 	meta Meta
 
@@ -79,8 +102,11 @@ type App struct {
 	nEvents     uint64
 	nAlerts     uint64
 	nContained  uint64
+	nUnlearned  uint64
 	recent      []control.Alert
 	recentLimit int
+	lag         lagStats // enrichment lag since the last heartbeat
+	ckptErrors  uint64   // failed baseline checkpoints
 
 	// graduated-response state: which processes are contained, at what rung, and
 	// when they last drew a high verdict (for escalation and auto-release).
@@ -119,6 +145,7 @@ type Meta struct {
 // repository used to persist the learned baseline, and run metadata.
 func New(cfg config.Config, objPath string, store profile.Repository, meta Meta) *App {
 	p := baseline.NewProfile()
+	p.SetMaxValuesPerKey(cfg.Learn.MaxValuesPerKey)
 	return &App{
 		cfg:         cfg,
 		objPath:     objPath,
@@ -137,6 +164,9 @@ func New(cfg config.Config, objPath string, store profile.Repository, meta Meta)
 		healGate:    writerSeesHostFile,
 		healDelay:   func() { time.Sleep(250 * time.Millisecond) },
 		sshd:        newSSHDIdentity(),
+		hostname:    os.Hostname,
+		monoNow:     monotonicNow,
+		overflown:   map[string]bool{},
 	}
 }
 
@@ -148,6 +178,9 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.store.Load(a.profile); err != nil {
 		return err
 	}
+	a.savedGen = a.profile.Generation()
+	log.Printf("baseline %s sha256=%s (%d value(s) refused at the per-feature cap so far)",
+		a.cfg.StatePath, a.store.Digest(), a.profile.Overflow())
 
 	aw, err := audit.Open(a.cfg.AuditPath)
 	if err != nil {
@@ -156,11 +189,17 @@ func (a *App) Run(ctx context.Context) error {
 	a.audit = aw
 	defer a.audit.Close()
 
+	if err := a.openNovelty(); err != nil {
+		return err // fail closed: a configured output that cannot be written is not running
+	}
+	defer a.sink.Close()
+
 	sensor, err := loader.Load(a.objPath)
 	if err != nil {
 		return err
 	}
 	defer sensor.Close()
+	a.drops = sensor.Drops
 
 	// Cancelling the context closes the sensor, which unblocks Read below.
 	go func() {
@@ -178,9 +217,14 @@ func (a *App) Run(ctx context.Context) error {
 
 	armed, failed, disarm := a.armFeatures(a.realArmers(sensor))
 	defer disarm()
+	a.armed = armed
 
 	if err := a.announceStartup(armed, failed); err != nil {
 		return err // fatal: an armed host we cannot account for must not run
+	}
+	go a.heartbeatLoop(ctx)
+	if a.cfg.Mode == mode.Learn {
+		go a.checkpointLoop(ctx)
 	}
 
 	log.Printf("sensors attached (creds, exec, egress, files, kernel-enabling ops, self-defense); mode=%s obj=%s", a.cfg.Mode, a.objPath)
@@ -206,74 +250,91 @@ func (a *App) Run(ctx context.Context) error {
 			log.Printf("decode: %v", err)
 			continue
 		}
-		ev = a.enricher.Enrich(ev)
-
-		// Self-defense is not a learned/averaged signal: an attempt to kill,
-		// stop, or ptrace the agent by anything other than its supervisor is
-		// intrinsically critical and is surfaced in every mode (including learn).
-		if ev.Kind == kind.SelfDefense {
-			a.mu.Lock()
-			a.nEvents++
-			a.mu.Unlock()
-			a.respondSelfDefense(ev)
-			continue
-		}
-
-		// A read of a planted decoy is intrinsically high-confidence (nothing
-		// legitimate references it) — surfaced directly, not via the baseline.
-		if ev.Kind == kind.Honeytoken {
-			a.mu.Lock()
-			a.nEvents++
-			a.mu.Unlock()
-			a.respondHoneytoken(ev)
-			continue
-		}
-
-		// The agent's own file writes (e.g. a self-heal restore) are never a
-		// threat — don't score them, and never let them re-trigger a heal. The
-		// agent is recognised by its tgid: any process can name itself "phaged".
-		if ev.Kind == kind.FileWrite && a.isSelf(ev.PID) {
-			a.mu.Lock()
-			a.nEvents++
-			a.mu.Unlock()
-			continue
-		}
-
-		var vec feature.Vector
-		switch ev.Kind {
-		case kind.Exec:
-			vec = a.execExtract.Extract(ev)
-		case kind.Connect:
-			vec = a.netExtract.Extract(ev)
-		case kind.FileWrite:
-			vec = a.fileExtract.Extract(ev)
-		case kind.Enable:
-			vec = a.enableExtract.Extract(ev)
-		default:
-			vec = a.extract.Extract(ev)
-		}
-
-		a.mu.Lock()
-		a.nEvents++
-		a.mu.Unlock()
-
-		if a.cfg.Mode == mode.Learn {
-			for k, v := range vec {
-				a.profile.Observe(k, v)
-			}
-			continue
-		}
-
-		// alert / enforce: score against the learned baseline, then let the
-		// graduated-response matrix pick the least-invasive sufficient action.
-		v := a.scorer.Score(vec)
-		want := response.Decide(ev.Kind, v.Score, a.cfg.Mode,
-			response.Thresholds(a.cfg.Thresholds),
-			response.Context{Interactive: ev.Session.Interactive, RaisedToRoot: ev.RaisedToRoot()})
-		if want != action.None {
-			a.respond(ev, v, want)
-		}
+		a.handle(ev)
 	}
+}
+
+// handle runs one decoded event through enrichment, learning or scoring, and
+// response. It is the body of the event loop, kept separate so tests can drive
+// it without a kernel.
+func (a *App) handle(ev model.Event) {
+	ev = a.enricher.Enrich(ev)
+	a.noteLag(&ev)
+
+	// Self-defense is not a learned/averaged signal: an attempt to kill,
+	// stop, or ptrace the agent by anything other than its supervisor is
+	// intrinsically critical and is surfaced in every mode (including learn).
+	if ev.Kind == kind.SelfDefense {
+		a.countEvent()
+		a.respondSelfDefense(ev)
+		return
+	}
+
+	// A read of a planted decoy is intrinsically high-confidence (nothing
+	// legitimate references it) — surfaced directly, not via the baseline.
+	if ev.Kind == kind.Honeytoken {
+		a.countEvent()
+		a.respondHoneytoken(ev)
+		return
+	}
+
+	// The agent's own file writes (e.g. a self-heal restore) are never a
+	// threat — don't score them, and never let them re-trigger a heal. The
+	// agent is recognised by its tgid: any process can name itself "phaged".
+	if ev.Kind == kind.FileWrite && a.isSelf(ev.PID) {
+		a.countEvent()
+		return
+	}
+
+	var vec feature.Vector
+	switch ev.Kind {
+	case kind.Exec:
+		vec = a.execExtract.Extract(ev)
+	case kind.Connect:
+		vec = a.netExtract.Extract(ev)
+	case kind.FileWrite:
+		vec = a.fileExtract.Extract(ev)
+	case kind.Enable:
+		vec = a.enableExtract.Extract(ev)
+	default:
+		vec = a.extract.Extract(ev)
+	}
+
+	a.countEvent()
+
+	if a.cfg.Mode == mode.Learn {
+		for k, v := range vec {
+			if a.profile.Observe(k, v) && !a.overflown[k] {
+				a.overflown[k] = true
+				log.Printf("BASELINE CAP: feature %s holds learn.max_values_per_key=%d distinct values; new values are counted as overflow, not learned, and stay novel",
+					k, a.cfg.Learn.MaxValuesPerKey)
+			}
+		}
+		return
+	}
+
+	// A feature class the baseline never saw scores 0 (neutral), which would
+	// make its first appearance silent. Report it as unlearned instead.
+	if keys := a.unlearnedKeys(vec); keys != nil {
+		a.reportUnlearned(ev, keys)
+		return
+	}
+
+	// alert / enforce: score against the learned baseline, then let the
+	// graduated-response matrix pick the least-invasive sufficient action.
+	v := a.scorer.Score(vec)
+	want := response.Decide(ev.Kind, v.Score, a.cfg.Mode,
+		response.Thresholds(a.cfg.Thresholds),
+		response.Context{Interactive: ev.Session.Interactive, RaisedToRoot: ev.RaisedToRoot()})
+	if want != action.None {
+		a.respond(ev, v, want)
+	}
+}
+
+func (a *App) countEvent() {
+	a.mu.Lock()
+	a.nEvents++
+	a.mu.Unlock()
 }
 
 // onShutdown persists the baseline when we have been learning.
@@ -281,11 +342,11 @@ func (a *App) onShutdown() error {
 	if a.cfg.Mode != mode.Learn {
 		return nil
 	}
-	if err := a.store.Save(a.profile); err != nil {
+	if err := a.saveBaseline(); err != nil {
 		log.Printf("save baseline: %v", err)
 		return err
 	}
-	log.Printf("baseline saved")
+	log.Printf("baseline saved sha256=%s", a.store.Digest())
 	return nil
 }
 
@@ -368,6 +429,9 @@ func (a *App) recordResponse(ev model.Event, v verdict.Verdict, requested, appli
 		Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
 	}); err != nil && err != audit.ErrDisabled {
 		log.Printf("audit: %v", err)
+	}
+	if a.novelty != nil && v.Score >= a.cfg.Thresholds.Notify {
+		a.novelty.Emit(a.ident.Finding(ev, v, a.baselineSHA(), time.Now()))
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -621,10 +685,16 @@ func (a *App) announceStartup(armed, failed []string) error {
 	src := a.cfg.Source
 	base := audit.Entry{
 		PID: a.selfPID, Comm: "phaged", Mode: a.cfg.Mode.String(), Version: a.meta.Version,
-		ConfigPath: src.Path, ConfigSHA256: src.SHA256,
+		ConfigPath: src.Path, ConfigSHA256: src.SHA256, BaselineSHA256: a.baselineSHA(),
 	}
-	prov := fmt.Sprintf("config_path=%q config_sha256=%s version=%q pid=%d",
-		src.Path, orNone(src.SHA256), a.meta.Version, a.selfPID)
+	if a.novelty != nil {
+		base.NoveltyPath, base.NoveltyEntity, base.TLP = a.cfg.Output.NoveltyPath, a.ident.EntityKind+":"+a.ident.Entity, a.ident.TLP
+		if a.sink == nil {
+			base.NoveltyPath = ""
+		}
+	}
+	prov := fmt.Sprintf("config_path=%q config_sha256=%s baseline_sha256=%s version=%q pid=%d",
+		src.Path, orNone(src.SHA256), a.baselineSHA(), a.meta.Version, a.selfPID)
 
 	var records []audit.Entry
 	if len(a.meta.Disarmed) > 0 {
@@ -703,15 +773,45 @@ func (a *App) gate(want action.Type) (action.Type, string) {
 
 // Status implements control.Handler.
 func (a *App) Status() control.Status {
+	// The drop counter is read live (outside a.mu: it is a map lookup).
+	var drops uint64
+	var dropsErr string
+	if a.drops == nil {
+		dropsErr = "sensor not loaded"
+	} else if n, err := a.drops(); err != nil {
+		dropsErr = err.Error()
+	} else {
+		drops = n
+	}
+	c := a.novelty.Counters()
+	var overflow uint64
+	if a.profile != nil {
+		overflow = a.profile.Overflow()
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return control.Status{
-		Mode:      a.cfg.Mode.String(),
-		Uptime:    time.Since(a.started).Truncate(time.Second).String(),
-		Events:    a.nEvents,
-		Alerts:    a.nAlerts,
-		Contained: a.nContained,
+	st := control.Status{
+		Mode:           a.cfg.Mode.String(),
+		Uptime:         time.Since(a.started).Truncate(time.Second).String(),
+		Events:         a.nEvents,
+		Alerts:         a.nAlerts,
+		Contained:      a.nContained,
+		Unlearned:      a.nUnlearned,
+		Drops:          drops,
+		DropsError:     dropsErr,
+		BaselineSHA256: a.baselineSHA(),
+		Overflow:       overflow,
+		NoveltyRows:    c.Rows,
+		NoveltyErrors:  c.Errors,
 	}
+	if a.sink != nil {
+		st.NoveltyPath = a.cfg.Output.NoveltyPath
+	}
+	if h := a.hb.last; h != nil {
+		st.EventsPerSec, st.EnrichLagMs = h.EventsPerSec, h.EnrichLagMsAvg
+		st.LastHeartbeat = a.hb.lastAt.UTC().Format(time.RFC3339)
+	}
+	return st
 }
 
 // RecentAlerts implements control.Handler: the last n surfaced verdicts.

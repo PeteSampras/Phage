@@ -101,6 +101,7 @@ type Session struct {
 type Event struct {
 	ID         uint64
 	Time       time.Time
+	KernelNs   uint64 // the kernel's capture time (bpf_ktime_get_ns: CLOCK_MONOTONIC); 0 when unknown
 	Kind       kind.Kind
 	PID        int32
 	PPID       int32

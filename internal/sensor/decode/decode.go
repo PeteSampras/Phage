@@ -67,7 +67,8 @@ func Event(b []byte) (model.Event, error) {
 	}
 	ev := model.Event{
 		ID:         r.ID,
-		Time:       time.Now(), // ts_ns is monotonic-since-boot; wall clock added here
+		Time:       time.Now(), // ts_ns is monotonic-since-boot; the daemon back-dates this by the measured lag
+		KernelNs:   r.TsNs,
 		Kind:       mapKind(r.Kind),
 		PID:        int32(r.PID),
 		PPID:       int32(r.PPID),

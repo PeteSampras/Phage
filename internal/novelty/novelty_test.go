@@ -327,3 +327,14 @@ func TestSinkWriteErrorIsReturned(t *testing.T) {
 		t.Error("a failed write must be reported")
 	}
 }
+
+func TestEmitterWithoutSinkOnlyDedupes(t *testing.T) {
+	e := NewEmitter(nil, time.Hour, t.Logf)
+	r := testID.Finding(events()["exec"], learned(), testSHA, emitAt)
+	if !e.Emit(r) || e.Emit(r) {
+		t.Fatal("dedupe must work without a sink")
+	}
+	if c := e.Counters(); c.Rows != 0 || c.Suppressed != 1 {
+		t.Errorf("counters = %+v: nothing was written", c)
+	}
+}

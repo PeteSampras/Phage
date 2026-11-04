@@ -149,7 +149,8 @@ const maxSeen = 65536
 const errorEvery = time.Minute
 
 // NewEmitter returns an Emitter writing to w. window is how long a uid is
-// remembered (the uid bucket). logf receives failure lines.
+// remembered (the uid bucket). logf receives failure lines. A nil w writes
+// nothing and only dedupes, so a caller can still log each new finding once.
 func NewEmitter(w writer, window time.Duration, logf func(string, ...any)) *Emitter {
 	return &Emitter{w: w, logf: logf, now: time.Now, seen: map[string]time.Time{}, window: window}
 }
@@ -178,6 +179,9 @@ func (e *Emitter) Emit(r Row) bool {
 		e.seen[r.UID] = now
 	}
 	e.mu.Unlock()
+	if e.w == nil {
+		return true // no sink: dedupe only (it still rate-limits the log line)
+	}
 
 	err := e.w.Write(r)
 
