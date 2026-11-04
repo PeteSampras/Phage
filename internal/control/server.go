@@ -3,8 +3,10 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net"
 	"os"
+	"time"
 )
 
 // Handler is implemented by the daemon to answer control requests.
@@ -21,16 +23,24 @@ type Server struct {
 
 // Serve starts a control server on the Unix socket at path. An empty path
 // disables the server (returns nil, nil). The server stops when ctx is done.
+//
+// The socket is created 0600 from the start (listenPrivate binds under umask
+// 077, so there is no window in which it is world-connectable), and every
+// connection's peer credentials (SO_PEERCRED) must be uid 0 — `phage thaw`
+// releases a contained process, so only root may drive it.
 func Serve(ctx context.Context, path string, h Handler) (*Server, error) {
 	if path == "" {
 		return nil, nil
 	}
 	_ = os.Remove(path) // clear a stale socket from a previous run
-	ln, err := net.Listen("unix", path)
+	ln, err := listenPrivate(path)
 	if err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := os.Chmod(path, 0o600); err != nil { // belt and braces
+		ln.Close()
+		return nil, err
+	}
 
 	s := &Server{ln: ln}
 	go func() {
@@ -47,12 +57,20 @@ func (s *Server) accept(h Handler) {
 		if err != nil {
 			return // listener closed
 		}
+		if err := checkPeer(conn); err != nil {
+			log.Printf("control socket: rejected connection: %v", err)
+			writeResp(conn, Response{OK: false, Error: "permission denied"})
+			conn.Close()
+			continue
+		}
 		go serveConn(conn, h)
 	}
 }
 
 func serveConn(conn net.Conn, h Handler) {
 	defer conn.Close()
+	// A client that connects and never sends must not pin a goroutine forever.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	var req Request
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		writeResp(conn, Response{OK: false, Error: "bad request"})
