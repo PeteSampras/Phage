@@ -14,28 +14,81 @@ import (
 // intentionally simple and will be extended (co-occurrence, decay, continuous
 // distributions) — see docs/design/analysis-engine.md.
 type Profile struct {
-	mu     sync.RWMutex
-	counts map[string]map[float64]uint64 // feature -> value -> times seen
-	totals map[string]uint64             // feature -> total observations
+	mu       sync.RWMutex
+	counts   map[string]map[float64]uint64 // feature -> value -> times seen
+	totals   map[string]uint64             // feature -> total observations
+	overflow map[string]uint64             // feature -> new values refused at the cap
+	max      int                           // distinct values per feature; 0 = unbounded
+	gen      uint64                        // bumped by every change, so a checkpoint can skip an unchanged profile
 }
 
-// NewProfile returns an empty profile ready to learn.
+// NewProfile returns an empty profile ready to learn, with no cap on distinct
+// values (see SetMaxValuesPerKey).
 func NewProfile() *Profile {
 	return &Profile{
-		counts: make(map[string]map[float64]uint64),
-		totals: make(map[string]uint64),
+		counts:   make(map[string]map[float64]uint64),
+		totals:   make(map[string]uint64),
+		overflow: make(map[string]uint64),
 	}
 }
 
-// Observe records a feature value as normal. Called only in learn mode.
-func (p *Profile) Observe(key string, value float64) {
+// SetMaxValuesPerKey caps how many distinct values one feature may learn (0:
+// no cap). It bounds the baseline's memory and file size on a host where one
+// feature is high-cardinality. A cap below what an imported baseline already
+// holds keeps the learned values and refuses only new ones.
+func (p *Profile) SetMaxValuesPerKey(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.counts[key] == nil {
-		p.counts[key] = make(map[float64]uint64)
+	p.max = n
+}
+
+// Observe records a feature value as normal. Called only in learn mode. It
+// returns true when the value was refused because the feature already holds
+// the maximum number of distinct values: the observation still counts towards
+// the feature's total (so the feature stays learned), the value is not learned
+// (so it stays novel), and the refusal is counted (Overflow).
+func (p *Profile) Observe(key string, value float64) (overflow bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gen++
+	byVal := p.counts[key]
+	if byVal == nil {
+		byVal = make(map[float64]uint64)
+		p.counts[key] = byVal
 	}
-	p.counts[key][value]++
 	p.totals[key]++
+	if _, seen := byVal[value]; !seen && p.max > 0 && len(byVal) >= p.max {
+		p.overflow[key]++
+		return true
+	}
+	byVal[value]++
+	return false
+}
+
+// Count reports how many times value was observed for key.
+func (p *Profile) Count(key string, value float64) uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.counts[key][value]
+}
+
+// Overflow reports the total number of values refused at the cap, over every
+// feature (including refusals recorded in an imported baseline).
+func (p *Profile) Overflow() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var n uint64
+	for _, c := range p.overflow {
+		n += c
+	}
+	return n
+}
+
+// Generation changes whenever the learned state changes.
+func (p *Profile) Generation() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.gen
 }
 
 // establishedSupport is how many times a specific value must have been observed
@@ -82,8 +135,9 @@ func (p *Profile) Samples(key string) uint64 {
 // Snapshot is the serialisable form of a Profile. Feature values are keyed by
 // their decimal string so the counts survive JSON (which has no float keys).
 type Snapshot struct {
-	Counts map[string]map[string]uint64 `json:"counts"`
-	Totals map[string]uint64            `json:"totals"`
+	Counts   map[string]map[string]uint64 `json:"counts"`
+	Totals   map[string]uint64            `json:"totals"`
+	Overflow map[string]uint64            `json:"overflow,omitempty"` // values refused at the per-feature cap
 }
 
 // Export returns a serialisable copy of the learned state.
@@ -103,6 +157,12 @@ func (p *Profile) Export() Snapshot {
 	}
 	for key, n := range p.totals {
 		s.Totals[key] = n
+	}
+	if len(p.overflow) > 0 {
+		s.Overflow = make(map[string]uint64, len(p.overflow))
+		for key, n := range p.overflow {
+			s.Overflow[key] = n
+		}
 	}
 	return s
 }
@@ -128,4 +188,9 @@ func (p *Profile) Import(s Snapshot) {
 	for key, n := range s.Totals {
 		p.totals[key] = n
 	}
+	p.overflow = make(map[string]uint64, len(s.Overflow))
+	for key, n := range s.Overflow {
+		p.overflow[key] = n
+	}
+	p.gen++
 }

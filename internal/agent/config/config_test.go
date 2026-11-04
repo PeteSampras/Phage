@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 )
@@ -243,5 +245,93 @@ func TestLoadRejectsBadReleaseAfter(t *testing.T) {
 		if _, err := Load(writeTemp(t, "release_after: "+v+"\n")); err == nil {
 			t.Errorf("release_after: %s accepted", v)
 		}
+	}
+}
+
+func TestOutputAndLearnDefaults(t *testing.T) {
+	c := Default()
+	o := c.Output
+	if o.NoveltyPath != "/var/lib/phage/novelty.jsonl" || o.Source != "phage-host" || o.EntityKind != "host" ||
+		o.Entity != "" || o.TLP != "red" || o.HeartbeatInterval != 60 || o.NoveltyBucket != time.Hour {
+		t.Errorf("output defaults = %+v", o)
+	}
+	if c.Learn.CheckpointInterval != 10*time.Minute || c.Learn.MaxValuesPerKey != 10000 {
+		t.Errorf("learn defaults = %+v", c.Learn)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+	if len(c.HostModifying()) != 0 {
+		t.Fatal("the output block must not arm anything")
+	}
+}
+
+func TestLoadOutputAndLearn(t *testing.T) {
+	p := writeTemp(t, `
+mode: alert
+output:
+  novelty_path: /tmp/n.jsonl
+  novelty_max_bytes: 0
+  novelty_bucket: 30m
+  source: phage-canary
+  entity_kind: ip
+  entity: 192.0.2.10
+  tlp: amber+strict
+  heartbeat_interval: 30
+learn:
+  checkpoint_interval: 5m
+  max_values_per_key: 50
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Output{NoveltyPath: "/tmp/n.jsonl", NoveltyBucket: 30 * time.Minute, Source: "phage-canary",
+		EntityKind: "ip", Entity: "192.0.2.10", TLP: "amber+strict", HeartbeatInterval: 30}
+	if c.Output != want {
+		t.Errorf("output = %+v, want %+v", c.Output, want)
+	}
+	if c.Learn != (Learn{CheckpointInterval: 5 * time.Minute, MaxValuesPerKey: 50}) {
+		t.Errorf("learn = %+v", c.Learn)
+	}
+}
+
+func TestOutputRefusals(t *testing.T) {
+	for name, body := range map[string]string{
+		"tlp prefixed":        "output:\n  tlp: TLP:AMBER\n",
+		"tlp upper case":      "output:\n  tlp: AMBER\n",
+		"tlp v1 white":        "output:\n  tlp: white\n",
+		"tlp empty":           "output:\n  tlp: \"\"\n",
+		"source with space":   "output:\n  source: phage host\n",
+		"source upper":        "output:\n  source: Phage\n",
+		"source lake":         "output:\n  source: lake-novelty\n",
+		"source too long":     "output:\n  source: " + strings.Repeat("a", 65) + "\n",
+		"unknown kind":        "output:\n  entity_kind: vm\n",
+		"ip without entity":   "output:\n  entity_kind: ip\n",
+		"ip not an address":   "output:\n  entity_kind: ip\n  entity: web01\n",
+		"ip not canonical":    "output:\n  entity_kind: ip\n  entity: \"2001:DB8::1\"\n",
+		"user without entity": "output:\n  entity_kind: user\n",
+		"entity with space":   "output:\n  entity: \"web 01\"\n",
+		"tiny rotation":       "output:\n  novelty_max_bytes: 1000\n",
+		"bucket too small":    "output:\n  novelty_bucket: 10s\n",
+		"bucket not duration": "output:\n  novelty_bucket: hourly\n",
+		"heartbeat zero":      "output:\n  heartbeat_interval: 0\n",
+		"unknown output key":  "output:\n  novelty: true\n",
+		"checkpoint tiny":     "learn:\n  checkpoint_interval: 1s\n",
+		"checkpoint bad":      "learn:\n  checkpoint_interval: often\n",
+		"cap zero":            "learn:\n  max_values_per_key: 0\n",
+	} {
+		if _, err := Load(writeTemp(t, body)); err == nil {
+			t.Errorf("%s: accepted %q", name, body)
+		}
+	}
+	// Every canonical label is accepted.
+	for _, l := range TLPLabels {
+		if _, err := Load(writeTemp(t, "output:\n  tlp: "+l+"\n")); err != nil {
+			t.Errorf("tlp %q refused: %v", l, err)
+		}
+	}
+	if _, err := Load(writeTemp(t, "output:\n  entity_kind: ip\n  entity: \"2001:db8::1\"\n")); err != nil {
+		t.Errorf("canonical v6 refused: %v", err)
 	}
 }

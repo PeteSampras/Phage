@@ -1,0 +1,13 @@
+{
+  "uid": "nov-host-1",
+  "time": "2026-03-28T13:05:00+00:00",
+  "as_of": "2026-03-28T13:05:00+00:00",
+  "source": "host-kernel",
+  "source_kind": "heuristic",
+  "profile": "process-lineage",
+  "entity_kind": "host",
+  "entity": "hv-01",
+  "value": "[\"sshd\", \"sh\"]",
+  "status": "unlearned",
+  "tlp": "green"
+}

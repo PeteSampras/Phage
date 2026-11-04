@@ -11,8 +11,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"os"
+	"regexp"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"gopkg.in/yaml.v3"
@@ -38,6 +42,8 @@ type Config struct {
 	Deception    Deception   // decoys; default off, allowed in alert and enforce
 	Dev          Dev         // development-only relaxations; never set in production
 	ReleaseAfter int         // seconds of quiet before an isolated process is auto-released (>= 1)
+	Output       Output      // novelty sink and health heartbeat (observability only; acts on nothing)
+	Learn        Learn       // baseline checkpointing and growth bounds
 
 	// Source identifies the file this config came from (empty when built from
 	// defaults). It is reported in the startup audit record so a SIEM can tell
@@ -76,6 +82,71 @@ type Dev struct {
 	// parent) stop it without that counting as tampering. Off: only pid 1 may.
 	TrustLauncherSignals bool
 }
+
+// Output configures what phaged reports for other systems to read. Nothing in
+// it acts on the host: it only writes files phaged owns.
+type Output struct {
+	// NoveltyPath is the JSON-lines file that receives one novelty_finding row
+	// (homelab-next ADR-0036) per verdict at or above the notify threshold, and
+	// one `unlearned` row when an event's feature class has no baseline. Written
+	// only in alert and enforce mode. Empty disables it.
+	NoveltyPath string
+	// NoveltyMaxBytes rotates the file to NoveltyPath+".1" once it would grow
+	// past this size. 0 never rotates (use logrotate copytruncate instead).
+	NoveltyMaxBytes int64
+	// NoveltyBucket is the time bucket in a row's uid: the same finding (same
+	// profile, entity, value and status) within one bucket has one uid, and
+	// phaged writes it once per bucket.
+	NoveltyBucket time.Duration
+	// Source names this sensor in the row's `source` column.
+	Source string
+	// EntityKind and Entity name the host in the shared entity namespace
+	// (ADR-0036 decision 7). Entity empty with kind host means the host name at
+	// startup; any other kind needs Entity set.
+	EntityKind string
+	Entity     string
+	// TLP is the TLP 2.0 label every row carries. It defaults to red (see
+	// DefaultTLP); only the five canonical lower-case labels are accepted.
+	TLP string
+	// HeartbeatInterval is the number of seconds between `heartbeat` audit
+	// records (sensor health), written in every mode.
+	HeartbeatInterval int
+}
+
+// Learn bounds the learned baseline.
+type Learn struct {
+	// CheckpointInterval is how often learn mode saves the baseline (atomic
+	// temp file + rename) while running, so a crash loses at most one interval.
+	CheckpointInterval time.Duration
+	// MaxValuesPerKey caps the distinct values one feature key may learn; a new
+	// value past the cap is counted as overflow and not learned.
+	MaxValuesPerKey int
+}
+
+// Novelty-row vocabularies (homelab-next schemas/ocsf/novelty_finding.v1.json).
+var (
+	// TLPLabels are the canonical TLP 2.0 labels, exactly as the lake stores them.
+	TLPLabels = []string{"clear", "green", "amber", "amber+strict", "red"}
+	// EntityKinds is the shared entity namespace.
+	EntityKinds = []string{"ip", "host", "user", "domain", "process", "other"}
+	// sourcePattern is the schema's pattern for `source` (and `profile`).
+	sourcePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
+)
+
+// Defaults for the output and learn blocks.
+const (
+	DefaultNoveltyPath     = "/var/lib/phage/novelty.jsonl"
+	DefaultNoveltyMaxBytes = 64 << 20
+	DefaultSource          = "phage-host"
+	// DefaultTLP is red: a row names host paths, addresses and programs, and
+	// red is the label that can never over-share. It is also invisible to a
+	// lake reader below red (homelab-next's corroborate), so set output.tlp
+	// explicitly to share rows (docs/wazuh.md, FORK.md).
+	DefaultTLP = "red"
+	// lakeSource is the lake analyzer's own source; a host sensor must not
+	// write under it (corroborate counts distinct sources).
+	lakeSource = "lake-novelty"
+)
 
 // Feature names, as they appear in the YAML, in logs and in audit records.
 const (
@@ -178,6 +249,16 @@ func Default() Config {
 		LearnWindow:  "168h",
 		Thresholds:   Thresholds{Notify: 0.4, Contain: 0.8},
 		ReleaseAfter: 300,
+		Output: Output{
+			NoveltyPath:       DefaultNoveltyPath,
+			NoveltyMaxBytes:   DefaultNoveltyMaxBytes,
+			NoveltyBucket:     time.Hour,
+			Source:            DefaultSource,
+			EntityKind:        "host",
+			TLP:               DefaultTLP,
+			HeartbeatInterval: 60,
+		},
+		Learn: Learn{CheckpointInterval: 10 * time.Minute, MaxValuesPerKey: 10000},
 		// Enforcement, Deception, Dev: zero value — nothing acts.
 	}
 }
@@ -222,6 +303,20 @@ type fileConfig struct {
 		TrustLauncherSignals *strictBool `yaml:"trust_launcher_signals"`
 	} `yaml:"dev"`
 	ReleaseAfter *int `yaml:"release_after"`
+	Output       *struct {
+		NoveltyPath       *string `yaml:"novelty_path"`
+		NoveltyMaxBytes   *int64  `yaml:"novelty_max_bytes"`
+		NoveltyBucket     *string `yaml:"novelty_bucket"`
+		Source            *string `yaml:"source"`
+		EntityKind        *string `yaml:"entity_kind"`
+		Entity            *string `yaml:"entity"`
+		TLP               *string `yaml:"tlp"`
+		HeartbeatInterval *int    `yaml:"heartbeat_interval"`
+	} `yaml:"output"`
+	Learn *struct {
+		CheckpointInterval *string `yaml:"checkpoint_interval"`
+		MaxValuesPerKey    *int    `yaml:"max_values_per_key"`
+	} `yaml:"learn"`
 }
 
 // Load reads a YAML config file, overlays it on Default(), and validates the
@@ -279,6 +374,30 @@ func Load(path string) (Config, error) {
 	if fc.ReleaseAfter != nil {
 		cfg.ReleaseAfter = *fc.ReleaseAfter
 	}
+	if o := fc.Output; o != nil {
+		setString(&cfg.Output.NoveltyPath, o.NoveltyPath)
+		if o.NoveltyMaxBytes != nil {
+			cfg.Output.NoveltyMaxBytes = *o.NoveltyMaxBytes
+		}
+		if err := setDuration(&cfg.Output.NoveltyBucket, o.NoveltyBucket); err != nil {
+			return Config{}, fmt.Errorf("config %q: output.novelty_bucket: %w", path, err)
+		}
+		setString(&cfg.Output.Source, o.Source)
+		setString(&cfg.Output.EntityKind, o.EntityKind)
+		setString(&cfg.Output.Entity, o.Entity)
+		setString(&cfg.Output.TLP, o.TLP)
+		if o.HeartbeatInterval != nil {
+			cfg.Output.HeartbeatInterval = *o.HeartbeatInterval
+		}
+	}
+	if l := fc.Learn; l != nil {
+		if err := setDuration(&cfg.Learn.CheckpointInterval, l.CheckpointInterval); err != nil {
+			return Config{}, fmt.Errorf("config %q: learn.checkpoint_interval: %w", path, err)
+		}
+		if l.MaxValuesPerKey != nil {
+			cfg.Learn.MaxValuesPerKey = *l.MaxValuesPerKey
+		}
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("config %q: %w", path, err)
@@ -302,6 +421,12 @@ func (c Config) Validate() error {
 	if c.ReleaseAfter < 1 {
 		return fmt.Errorf("release_after %d must be at least 1 second", c.ReleaseAfter)
 	}
+	if err := c.Output.validate(); err != nil {
+		return err
+	}
+	if err := c.Learn.validate(); err != nil {
+		return err
+	}
 	// Fail closed: an acting feature switched on outside enforce mode is a
 	// contradiction the operator must resolve, not something to quietly ignore.
 	if req := c.Enforcement.Requested(); len(req) > 0 && c.Mode != mode.Enforce {
@@ -316,6 +441,97 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%s enabled but audit_path is empty: host-modifying features require an audit trail",
 			strings.Join(hm, ", "))
 	}
+	return nil
+}
+
+func (o Output) validate() error {
+	if !contains(TLPLabels, o.TLP) {
+		return fmt.Errorf("output.tlp %q is not a TLP 2.0 label: use one of %s, exactly (lower case, no TLP: prefix)",
+			o.TLP, strings.Join(TLPLabels, ", "))
+	}
+	if len(o.Source) > 64 || !sourcePattern.MatchString(o.Source) {
+		return fmt.Errorf("output.source %q must be lower-case words joined by single hyphens (at most 64 characters)", o.Source)
+	}
+	if o.Source == lakeSource {
+		return fmt.Errorf("output.source %q is the lake analyzer's own source; a host sensor needs its own", o.Source)
+	}
+	if !contains(EntityKinds, o.EntityKind) {
+		return fmt.Errorf("output.entity_kind %q must be one of %s", o.EntityKind, strings.Join(EntityKinds, ", "))
+	}
+	if err := ValidateEntity(o.EntityKind, o.Entity, o.EntityKind == "host"); err != nil {
+		return err
+	}
+	if o.NoveltyMaxBytes != 0 && o.NoveltyMaxBytes < 1<<20 {
+		return fmt.Errorf("output.novelty_max_bytes %d must be 0 (never rotate) or at least 1048576", o.NoveltyMaxBytes)
+	}
+	if o.NoveltyBucket < time.Minute || o.NoveltyBucket > 24*time.Hour {
+		return fmt.Errorf("output.novelty_bucket %s must be between 1m and 24h", o.NoveltyBucket)
+	}
+	if o.HeartbeatInterval < 5 || o.HeartbeatInterval > 3600 {
+		return fmt.Errorf("output.heartbeat_interval %d must be between 5 and 3600 seconds", o.HeartbeatInterval)
+	}
+	return nil
+}
+
+// ValidateEntity checks an entity's text for its kind. An empty entity is
+// allowed only when emptyOK (kind host: the host name is filled in at
+// startup). An ip must be written in canonical form (as netip prints it), the
+// form a lake profile holds, so both sources name one entity identically.
+func ValidateEntity(kind, entity string, emptyOK bool) error {
+	if entity == "" {
+		if emptyOK {
+			return nil
+		}
+		return fmt.Errorf("output.entity is required when output.entity_kind is %q", kind)
+	}
+	if len(entity) > 512 {
+		return fmt.Errorf("output.entity is %d bytes; at most 512", len(entity))
+	}
+	for _, r := range entity {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return fmt.Errorf("output.entity %q must not contain spaces or control characters", entity)
+		}
+	}
+	if kind == "ip" {
+		a, err := netip.ParseAddr(entity)
+		if err != nil {
+			return fmt.Errorf("output.entity %q is not an IP address: %w", entity, err)
+		}
+		if a.String() != entity {
+			return fmt.Errorf("output.entity %q is not in canonical form; write %q", entity, a.String())
+		}
+	}
+	return nil
+}
+
+func (l Learn) validate() error {
+	if l.CheckpointInterval < 10*time.Second || l.CheckpointInterval > 24*time.Hour {
+		return fmt.Errorf("learn.checkpoint_interval %s must be between 10s and 24h", l.CheckpointInterval)
+	}
+	if l.MaxValuesPerKey < 1 {
+		return fmt.Errorf("learn.max_values_per_key %d must be at least 1", l.MaxValuesPerKey)
+	}
+	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func setDuration(dst *time.Duration, src *string) error {
+	if src == nil {
+		return nil
+	}
+	d, err := time.ParseDuration(*src)
+	if err != nil {
+		return err
+	}
+	*dst = d
 	return nil
 }
 

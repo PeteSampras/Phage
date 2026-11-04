@@ -94,10 +94,12 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 	var score, weightSum, floor float64
 	for key, val := range v {
 		s := a.profile.Surprise(key, val)
+		samples := a.profile.Samples(key)
 		// Discount surprise from features not yet observed enough times to trust,
 		// so a freshly-deployed agent never raises confident alerts off a thin
 		// baseline; mature features (>= minConfidentSamples) are unaffected.
-		conf := confidence(a.profile.Samples(key))
+		conf := confidence(samples)
+		terms := verdict.Reason{Surprise: s, Confidence: conf, Support: a.profile.Count(key, val), Samples: samples}
 
 		if overrideFeatures[key] {
 			// Floor the score by the flag's own learned surprise; keep it out of
@@ -109,9 +111,9 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 			if f > floor {
 				floor = f
 			}
-			out.Reasons = append(out.Reasons, verdict.Reason{
-				Feature: key, Contribution: f, Detail: explain(key, val, s),
-			})
+			r := terms
+			r.Feature, r.Contribution, r.Detail = key, f, explain(key, val, s)
+			out.Reasons = append(out.Reasons, r)
 			continue
 		}
 
@@ -128,11 +130,9 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 			continue
 		}
 		score += contribution
-		out.Reasons = append(out.Reasons, verdict.Reason{
-			Feature:      key,
-			Contribution: contribution,
-			Detail:       explain(key, val, s),
-		})
+		r := terms
+		r.Feature, r.Contribution, r.Detail = key, contribution, explain(key, val, s)
+		out.Reasons = append(out.Reasons, r)
 	}
 	if weightSum > 0 {
 		score /= weightSum

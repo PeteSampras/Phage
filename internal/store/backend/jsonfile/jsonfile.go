@@ -5,19 +5,47 @@
 package jsonfile
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/AzozzALFiras/Phage/internal/analysis/baseline"
 )
 
-// Store is a file-backed Repository.
+// Store is a file-backed Repository. It remembers the sha256 of the bytes it
+// last loaded or saved, so the daemon can name the exact baseline it runs on.
 type Store struct {
 	path string
+
+	mu     sync.Mutex
+	digest string
+}
+
+// NoBaseline is the digest reported when no baseline file exists yet.
+const NoBaseline = "none"
+
+// Digest returns the hex sha256 of the baseline file as last loaded or saved,
+// or NoBaseline before a file exists.
+func (s *Store) Digest() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.digest == "" {
+		return NoBaseline
+	}
+	return s.digest
+}
+
+func (s *Store) setDigest(b []byte) {
+	sum := sha256.Sum256(b)
+	s.mu.Lock()
+	s.digest = hex.EncodeToString(sum[:])
+	s.mu.Unlock()
 }
 
 // New returns a Store backed by the file at path.
@@ -37,11 +65,14 @@ func (s *Store) Load(p *baseline.Profile) error {
 		return fmt.Errorf("parse baseline %q: %w", s.path, err)
 	}
 	p.Import(snap)
+	s.setDigest(b)
 	return nil
 }
 
 // Save writes p atomically: marshal, write a temp file in the same directory,
-// fsync, then rename over the target.
+// fsync, then rename over the target. A crash at any point leaves either the
+// previous file or the new one, never a partial file. The learn-mode
+// checkpoint and the save at shutdown both come through here.
 func (s *Store) Save(p *baseline.Profile) error {
 	if dir := filepath.Dir(s.path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -73,5 +104,6 @@ func (s *Store) Save(p *baseline.Profile) error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("rename into place: %w", err)
 	}
+	s.setDigest(b)
 	return nil
 }

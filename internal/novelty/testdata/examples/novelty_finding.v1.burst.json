@@ -1,0 +1,28 @@
+{
+  "uid": "nov-burst-0001",
+  "time": "2026-03-28T00:00:00Z",
+  "as_of": "2026-03-29T00:00:00Z",
+  "source": "lake-novelty",
+  "source_kind": "heuristic",
+  "profile": "host-dst-port",
+  "entity_kind": "ip",
+  "entity": "192.0.2.77",
+  "entity_column": "src_endpoint.ip",
+  "value_columns": [
+    "dst_endpoint.port"
+  ],
+  "status": "burst",
+  "entity_total": 0.0,
+  "count": 60,
+  "learn_since": "2026-02-28T00:00:00Z",
+  "learn_until": "2026-03-28T00:00:00Z",
+  "score_since": "2026-03-28T00:00:00Z",
+  "score_until": "2026-03-29T00:00:00Z",
+  "spec_digest": "sha256:abababababababababababababababababababababababababababababababab",
+  "message": "192.0.2.77: 60 rows with more than 200 distinct dst_endpoint.port values in the scoring window (a burst, such as a scan)",
+  "reasons": [
+    "entity_total 0 over the learning window",
+    "60 distinct values in the scoring window > max_values_per_entity 200: not scored (a signal)"
+  ],
+  "tlp": "amber"
+}

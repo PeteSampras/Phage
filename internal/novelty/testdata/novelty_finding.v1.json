@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.internal/homelabnext/ocsf/novelty_finding/1.0",
+  "x-draft": "ADR-0036 (proposed): written by homelabnext.novelty (hnx novelty run) and read by its corroborate; not frozen until ADR-0036 is accepted",
+  "title": "Novelty Finding",
+  "description": "An advisory behavioural-novelty finding (ADR-0036 decision 6; docs/novelty.md): the platform's own table in the OCSF conventions of this directory, not an OCSF class (ocsf_class_uid 0 is OCSF's base event). Every row is heuristic: no deterministic gate escalates on one alone. Written by the lake novelty analyzer and, in the same shape, by host-kernel sensors with their own source.",
+  "x-lake": {
+    "table": "novelty_finding",
+    "ocsf_class": "base_event",
+    "ocsf_class_uid": 0,
+    "ocsf_version": "1.3.0",
+    "key": [
+      "source",
+      "uid"
+    ],
+    "time_column": "time",
+    "partition": "day(time)"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "uid",
+    "time",
+    "as_of",
+    "source",
+    "source_kind",
+    "profile",
+    "entity_kind",
+    "entity",
+    "status"
+  ],
+  "properties": {
+    "uid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Deterministic id within its source: a digest of the source, the profile's spec, as_of, status, entity kind, entity and value. With source, the idempotency (content) key of the table, so one source cannot claim another's uid."
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The start of the behaviour window the finding describes: score_since for the lake analyzer (as_of - score_hours), the observation time for a host sensor. corroborate windows on it. RFC 3339 with an explicit offset; stored as UTC."
+    },
+    "as_of": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The instant the run scored up to (the end of the scoring window)."
+    },
+    "source": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      "description": "What produced the finding: lake-novelty for the lake analyzer, a host sensor's own name otherwise. A cooperating writer writes only its own source (write_findings checks the rows, the mark and the batch id; the lake refuses another source's batch id), so distinct sources are distinct writers; the engine cannot check which source an inserted row names, so this is a convention of the writers, not a guarantee. corroborate counts distinct sources."
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "heuristic"
+      ],
+      "description": "Always heuristic: a novelty finding is advisory (ADR-0036 decision 6)."
+    },
+    "profile": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      "description": "The spec profile (or the host sensor's baseline) that produced the finding."
+    },
+    "entity_kind": {
+      "type": "string",
+      "enum": [
+        "ip",
+        "host",
+        "user",
+        "domain",
+        "process",
+        "other"
+      ],
+      "description": "The shared entity namespace the entity belongs to (ADR-0036 decision 7): every source names an address as ip, a host as host and so on, so corroborate matches one entity across sources by (entity_kind, entity), never by bare text."
+    },
+    "entity": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "The entity's value as text (a string as is, anything else as JSON)."
+    },
+    "entity_column": {
+      "type": "string",
+      "maxLength": 255,
+      "description": "The column path the entity came from."
+    },
+    "value": {
+      "type": "string",
+      "maxLength": 2048,
+      "description": "The value as text: the one value, or a JSON array when the profile has several value columns. Absent for a burst or high-cardinality row."
+    },
+    "value_columns": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 255
+      },
+      "description": "The column paths the value came from."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "finding",
+        "unlearned",
+        "burst",
+        "high_cardinality"
+      ],
+      "description": "finding: scored at or above emit_at; unlearned: the entity has no learned support, so no score; burst: more distinct values than the profile allows in the scoring window alone (a scan), reported once with its row count there, not scored, and a signal; high_cardinality: more distinct learned values than the profile allows, reported once and not scored, not a signal."
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "surprise x confidence; present only when status is finding."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "min(1, entity_total / entity_min_samples); present only when status is finding."
+    },
+    "support": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Decayed support s(entity, value) in the learning window."
+    },
+    "entity_total": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Decayed entity total T(entity) over all its values in the learning window."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Rows of (entity, value) in the scoring window."
+    },
+    "learn_since": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Start of the learning window (inclusive)."
+    },
+    "learn_until": {
+      "type": "string",
+      "format": "date-time",
+      "description": "End of the learning window (exclusive) = start of the scoring window."
+    },
+    "score_since": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Start of the scoring window (inclusive)."
+    },
+    "score_until": {
+      "type": "string",
+      "format": "date-time",
+      "description": "End of the scoring window (exclusive) = as_of."
+    },
+    "spec_digest": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "sha256 of the profile's canonical spec, so a finding names the parameters that produced it."
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 4096,
+      "description": "One line: what is new, for whom, and the arithmetic."
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 512
+      },
+      "description": "The terms of the decision, one per entry (support, total, surprise, confidence, threshold)."
+    },
+    "tlp": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "green",
+        "amber",
+        "amber+strict",
+        "red"
+      ],
+      "description": "The row's TLP 2.0 label (ADR-0033 decision 5): the strictest label among the rows that produced the finding, its learning-window rows included (ADR-0036 decision 5). The lake refuses a row without one."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "finding"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "score",
+          "confidence"
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "score"
+              ]
+            },
+            {
+              "required": [
+                "confidence"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

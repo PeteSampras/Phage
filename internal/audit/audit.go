@@ -21,6 +21,7 @@ const (
 	KindEnforcementArmed = "enforcement_armed" // startup, when any host-modifying feature was requested
 	KindDisarmed         = "disarmed"          // startup, when a -mode downgrade switched features off
 	KindSelfHeal         = "self_heal"         // one self-heal attempt: healed | unchanged | failed:<err>
+	KindHeartbeat        = "heartbeat"         // periodic sensor health, every output.heartbeat_interval seconds
 )
 
 // Startup status values.
@@ -53,6 +54,40 @@ type Entry struct {
 	Features     []string `json:"features,omitempty"` // host-modifying features that armed
 	Failed       []string `json:"failed,omitempty"`   // requested but not armed
 	Disarmed     []string `json:"disarmed,omitempty"` // switched off by a -mode downgrade
+
+	// Startup and heartbeat: the baseline in use (sha256 of the file's bytes;
+	// "none" for a fresh host) and where novelty rows go.
+	BaselineSHA256 string `json:"baseline_sha256,omitempty"`
+	NoveltyPath    string `json:"novelty_path,omitempty"`
+	NoveltyEntity  string `json:"novelty_entity,omitempty"` // entity_kind:entity
+	TLP            string `json:"tlp,omitempty"`            // the novelty rows' label
+
+	Health *Health `json:"health,omitempty"` // heartbeat only
+}
+
+// Health is a heartbeat's measurement of the sensor over the interval since
+// the previous heartbeat. Every field is always present (no omitempty), so a
+// SIEM rule can match a zero.
+type Health struct {
+	IntervalSeconds float64 `json:"interval_seconds"`
+	Events          uint64  `json:"events"`         // events read from the ring buffer in the interval
+	EventsPerSec    float64 `json:"events_per_sec"` // events / interval_seconds
+	// Drops counts failed ring-buffer reservations in the kernel (events the
+	// sensors saw but could not hand to phaged) in the interval; DropsTotal
+	// since the sensors loaded. DropsError says why they could not be read.
+	Drops      uint64 `json:"drops"`
+	DropsTotal uint64 `json:"drops_total"`
+	DropsError string `json:"drops_error"`
+	// Enrichment lag: from the kernel timestamp to the enriched event, in ms.
+	EnrichLagMsAvg float64 `json:"enrich_lag_ms_avg"`
+	EnrichLagMsMax float64 `json:"enrich_lag_ms_max"`
+	// Novelty sink, in the interval.
+	NoveltyRows       uint64 `json:"novelty_rows"`
+	NoveltySuppressed uint64 `json:"novelty_suppressed"` // duplicates within one uid bucket
+	NoveltyErrors     uint64 `json:"novelty_errors"`
+	// Baseline, cumulative since start.
+	BaselineOverflow uint64 `json:"baseline_overflow"`
+	CheckpointErrors uint64 `json:"checkpoint_errors"`
 }
 
 // Writer appends entries to a file. A nil *Writer is valid and discards writes,
@@ -63,30 +98,37 @@ type Writer struct {
 	f  *os.File
 }
 
-// Open returns a Writer appending to path, created 0600. The final component
-// is opened O_NOFOLLOW so a planted symlink cannot redirect root's appends,
-// O_NONBLOCK so a FIFO planted there fails instead of hanging startup, only a
-// regular file is accepted, and a pre-existing file with looser permissions is
-// tightened. An empty path
+// Open returns a Writer appending to path (see OpenAppendFile). An empty path
 // disables auditing (nil *Writer).
 func Open(path string) (*Writer, error) {
 	if path == "" {
 		return nil, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("audit trail directory: %w", err)
-	}
-	const flags = os.O_WRONLY | os.O_APPEND | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
-	// A new trail is created 0600 exclusively, so its mode comes from the
-	// create alone; only a pre-existing trail is vetted and tightened.
-	f, err := os.OpenFile(path, flags|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		f, err = openExisting(path, flags)
-	}
+	f, err := OpenAppendFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open audit trail %q: %w", path, err)
 	}
 	return &Writer{f: f}, nil
+}
+
+// OpenAppendFile opens path for appending, created 0600 (its directory 0700).
+// The final component is opened O_NOFOLLOW so a planted symlink cannot
+// redirect root's appends, O_NONBLOCK so a FIFO planted there fails instead of
+// hanging startup, only a regular file is accepted, and a pre-existing file
+// with looser permissions is tightened. The audit trail and the novelty sink
+// both open their files this way.
+func OpenAppendFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("directory: %w", err)
+	}
+	const flags = os.O_WRONLY | os.O_APPEND | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
+	// A new file is created 0600 exclusively, so its mode comes from the
+	// create alone; only a pre-existing file is vetted and tightened.
+	f, err := os.OpenFile(path, flags|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		f, err = openExisting(path, flags)
+	}
+	return f, err
 }
 
 func openExisting(path string, flags int) (*os.File, error) {

@@ -216,3 +216,20 @@ func TestEmptyBaselineIsNeutral(t *testing.T) {
 		t.Fatalf("empty-baseline score = %.2f, want 0", v.Score)
 	}
 }
+
+// Each reason carries the arithmetic behind it, which the novelty row reports.
+func TestReasonsCarryTheirTerms(t *testing.T) {
+	p := baseline.NewProfile()
+	for i := 0; i < 6; i++ {
+		p.Observe(feature.FeatNetEgressPort, 443)
+	}
+	p.Observe(feature.FeatNetEgressPort, 22)
+	v := New(p).Score(feature.Vector{feature.FeatNetEgressPort: 22})
+	if len(v.Reasons) != 1 {
+		t.Fatalf("reasons = %+v", v.Reasons)
+	}
+	r := v.Reasons[0]
+	if r.Support != 1 || r.Samples != 7 || r.Surprise != 0.8 || r.Confidence != 7.0/15 {
+		t.Errorf("terms = support %d samples %d surprise %v confidence %v", r.Support, r.Samples, r.Surprise, r.Confidence)
+	}
+}

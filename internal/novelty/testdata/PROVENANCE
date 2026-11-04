@@ -1,0 +1,12 @@
+These files are verbatim copies from homelab-next (github.com/PeteSampras/homelab-next),
+commit 47042a05cc7fc3c76287802211822c1fcf048417 (origin/main on 2026-11-04):
+
+  novelty_finding.v1.json            schemas/ocsf/novelty_finding.v1.json
+                                     sha256 e4864a15f43d72ca1ed23c5fe6c250934e63b60f856949b105e12c63f9fee326
+  examples/novelty_finding.v1.*.json schemas/ocsf/examples/novelty_finding.v1.*.json
+  negative/novelty_finding.v1.*.json schemas/ocsf/negative/novelty_finding.v1.*.json
+
+The schema is a draft until homelab-next ADR-0036 is accepted. To refresh, copy the
+files again from a newer commit, update this note, and run `go test ./internal/novelty/`:
+schema_test.go fails on any schema keyword its validator does not implement, so a
+schema change cannot pass unnoticed.

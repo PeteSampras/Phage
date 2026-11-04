@@ -13,4 +13,7 @@ type Repository interface {
 	Load(p *baseline.Profile) error
 	// Save persists p's current learned state.
 	Save(p *baseline.Profile) error
+	// Digest identifies the stored baseline as last loaded or saved (the hex
+	// sha256 of its bytes), or "none" when nothing is stored yet.
+	Digest() string
 }

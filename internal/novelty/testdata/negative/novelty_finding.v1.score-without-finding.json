@@ -1,0 +1,31 @@
+{
+  "uid": "nov-0123456789abcdef0123456789abcdef",
+  "time": "2026-03-28T00:00:00Z",
+  "as_of": "2026-03-29T00:00:00Z",
+  "source": "lake-novelty",
+  "source_kind": "heuristic",
+  "profile": "host-dst-port",
+  "entity_kind": "ip",
+  "entity": "192.0.2.10",
+  "entity_column": "src_endpoint.ip",
+  "value": "4444",
+  "value_columns": [
+    "dst_endpoint.port"
+  ],
+  "status": "unlearned",
+  "score": 0.75,
+  "confidence": 1.0,
+  "support": 0.25,
+  "entity_total": 42.5,
+  "count": 3,
+  "learn_since": "2026-02-28T00:00:00Z",
+  "learn_until": "2026-03-28T00:00:00Z",
+  "score_since": "2026-03-28T00:00:00Z",
+  "score_until": "2026-03-29T00:00:00Z",
+  "spec_digest": "sha256:abababababababababababababababababababababababababababababababab",
+  "message": "192.0.2.10: dst_endpoint.port 4444 is new (support 0.25 < 1; score 0.75)",
+  "reasons": [
+    "support 0.25 < min_support 1"
+  ],
+  "tlp": "amber"
+}
