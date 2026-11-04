@@ -21,7 +21,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 die() { echo "release: $*" >&2; exit 1; }
 
-for tool in go git clang sha256sum; do
+for tool in go git clang llvm-strip sha256sum; do
 	command -v "$tool" >/dev/null 2>&1 || die "missing $tool"
 done
 [[ "$(uname -s)" == Linux ]] || die "the eBPF objects build on Linux only"
@@ -38,6 +38,12 @@ want=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2; exit }' go.mod)
 if [[ "${GOTOOLCHAIN:-}" != "go$want" ]]; then
 	export GOTOOLCHAIN=local
 fi
+# Nothing from the caller's environment or go env file may weaken how a
+# toolchain or module is fetched and verified: the public proxy, verified
+# against the public checksum database, nothing exempt.
+export GOENV=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOFLAGS=
+unset GONOSUMDB GONOSUMCHECK GONOPROXY GOPRIVATE GOINSECURE
+[[ "$(go env GOSUMDB)" == sum.golang.org ]] || die "GOSUMDB is not sum.golang.org"
 have=$(go env GOVERSION)
 [[ "$have" == "go$want" ]] || die "go.mod pins go$want but the local toolchain is $have; install go$want, or run with GOTOOLCHAIN=go$want"
 
@@ -82,6 +88,8 @@ cp deploy/phage.service configs/phage.example.yaml LICENSE deploy/wazuh/phage-he
 	echo "commit $commit"
 	echo "go $(go env GOVERSION) GOOS=$(go env GOOS) GOARCH=$(go env GOARCH) CGO_ENABLED=0 -trimpath -buildvcs=true"
 	echo "clang $(clang --version | head -n1)"
+	echo "llvm-strip $(llvm-strip --version | grep -m1 -i version)"
+	echo "bpftool $("${BPFTOOL:-bpftool}" version 2>/dev/null | head -n1)"
 	echo "vmlinux.h sha256 $(sha256sum bpf/include/vmlinux/vmlinux.h | cut -d' ' -f1) from kernel $(uname -r)"
 } >"$out/BUILDINFO"
 

@@ -3,6 +3,7 @@
 
 GO        ?= go
 CLANG     ?= clang
+LLVM_STRIP ?= llvm-strip
 BIN       ?= bin
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS   := -X main.version=$(VERSION)
@@ -66,18 +67,20 @@ bpf: $(BPF_OBJS) ## Compile every eBPF program with CO-RE (Linux)
 bpf/build/%.bpf.o: bpf/programs/%.bpf.c
 	@mkdir -p bpf/build
 	$(CLANG) -O2 -g -Wall -target bpf -D__TARGET_ARCH_$(BPF_ARCH) \
+		-ffile-prefix-map=$(CURDIR)=. \
 		-I bpf/include/vmlinux -I bpf/programs \
 		-c $< -o $@
-	@llvm-strip -g $@ 2>/dev/null || true
+	$(LLVM_STRIP) -g $@
 	@echo "built $@"
 
 install: ## Install binaries, eBPF objects, config, and the systemd unit (Linux, root)
 	@test -f $(BIN)/phaged || { echo "missing $(BIN)/phaged — run 'make build' first"; exit 1; }
-	@test -f bpf/build/sensors.bpf.o || { echo "missing eBPF objects — run 'make bpf' first (needs Linux + clang)"; exit 1; }
+	@test -f bpf/build/sensors.bpf.o || test -f $(BIN)/bpf/sensors.bpf.o || { echo "missing eBPF objects — run 'make bpf' first (needs Linux + clang)"; exit 1; }
 	install -d $(BINDIR) $(LIBDIR) $(SYSCONFDIR) $(UNITDIR)
 	install -m 0755 $(BIN)/phaged $(BIN)/phage $(BIN)/phage-jail $(BINDIR)/
-	install -m 0644 bpf/build/*.bpf.o $(LIBDIR)/
-	install -m 0755 deploy/wazuh/phage-heartbeat-check $(LIBDIR)/
+	@# BIN=dist/release/<version> installs that release's objects and check, not the tree's.
+	if [ -d $(BIN)/bpf ]; then install -m 0644 $(BIN)/bpf/*.bpf.o $(LIBDIR)/; else install -m 0644 bpf/build/*.bpf.o $(LIBDIR)/; fi
+	if [ -f $(BIN)/phage-heartbeat-check ]; then install -m 0755 $(BIN)/phage-heartbeat-check $(LIBDIR)/; else install -m 0755 deploy/wazuh/phage-heartbeat-check $(LIBDIR)/; fi
 	install -m 0644 deploy/phage.service $(UNITDIR)/phage.service
 	@if [ -f $(SYSCONFDIR)/phage.yaml ]; then \
 		echo "keeping existing $(SYSCONFDIR)/phage.yaml"; \

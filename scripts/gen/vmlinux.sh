@@ -15,6 +15,7 @@ if [[ ! -r /sys/kernel/btf/vmlinux ]]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
+trap 'rm -f "$OUT.tmp"' EXIT
 "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > "$OUT.tmp"
 mv "$OUT.tmp" "$OUT"
 echo "wrote $OUT"
