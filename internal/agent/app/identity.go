@@ -25,7 +25,9 @@ type procView interface {
 	ExeID(pid int32) (id fileID, nlink uint64, link string, err error)
 	PPID(pid int32) (int32, error)
 	UID(pid int32) (int, error) // real uid
-	MntNS(pid int32) (string, error)
+	// RootFileID stats path as the process sees it: resolved inside
+	// /proc/<pid>/root, following no symlinks.
+	RootFileID(pid int32, path string) (fileID, error)
 }
 
 // hostProc reads the real /proc.
@@ -66,10 +68,6 @@ func (hostProc) UID(pid int32) (int, error) {
 		}
 	}
 	return -1, fmt.Errorf("no Uid line for pid %d", pid)
-}
-
-func (hostProc) MntNS(pid int32) (string, error) {
-	return os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", pid))
 }
 
 // sshdExes are the OpenSSH server binaries (the listener, and the per-session
@@ -235,24 +233,44 @@ func containmentSafe(ev model.Event, self int32, v procView, sshd *sshdIdentity)
 	return true, ""
 }
 
-// sameMountNS reports whether pid shares the host's (pid 1's) mount namespace.
-// A file-write event's path is resolved in the writer's namespace, so a write
-// from a container to its own /root/.ssh/authorized_keys must not trigger a heal
-// of the host's file of the same name.
-func sameMountNS(v procView, pid int32) (bool, string) {
+// writerSeesHostFile decides whether a malicious write reported at path may
+// trigger a heal of the HOST file at path. The event's path was resolved in
+// the writer's view of the filesystem, which can differ from the host's (a
+// container, or `unshare -m`). A namespace comparison is the wrong test: a new
+// mount namespace that has not remounted anything still writes the host inode.
+// So: resolve path inside the writer's root (/proc/<pid>/root, no symlinks)
+// and heal only if that is the host's inode. If the writer's view cannot be
+// read (it exited, or the path no longer resolves there), heal anyway and let
+// the content decide — Heal compares the HOST file with its own snapshot and
+// does nothing if it is unchanged, which is exactly the case of a container
+// writing its private copy. Only a definite "different file" skips the heal.
+func writerSeesHostFile(v procView, pid int32, path string) (bool, string) {
+	host, err := lstatID(path)
+	if err != nil {
+		return true, "" // host file missing or unreadable: Heal restores or refuses
+	}
 	if v == nil {
-		return false, "no /proc view"
+		return true, ""
 	}
-	host, err := v.MntNS(1)
+	w, err := v.RootFileID(pid, path)
 	if err != nil {
-		return false, fmt.Sprintf("cannot read pid 1 mount namespace: %v", err)
+		return true, "" // writer gone / view unreadable: the host file's content decides
 	}
-	ns, err := v.MntNS(pid)
-	if err != nil {
-		return false, fmt.Sprintf("writer pid %d gone or unreadable: %v", pid, err)
-	}
-	if ns != host {
-		return false, fmt.Sprintf("writer pid %d is in mount namespace %s, not the host's %s", pid, ns, host)
+	if w != host {
+		return false, fmt.Sprintf("writer pid %d resolves %s to a different file (dev %d ino %d) than the host's (dev %d ino %d) — its own namespace's copy",
+			pid, path, w.dev, w.ino, host.dev, host.ino)
 	}
 	return true, ""
+}
+
+func lstatID(path string) (fileID, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileID{}, fmt.Errorf("no stat for %s", path)
+	}
+	return fileID{uint64(st.Dev), uint64(st.Ino)}, nil
 }

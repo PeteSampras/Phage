@@ -39,7 +39,8 @@ var ErrUnsafe = errors.New("unsafe path")
 type Store struct {
 	mu         sync.Mutex
 	good       map[string]snapshot
-	inflight   map[string]bool
+	inflight   map[string]bool // a heal is running for this path
+	dirty      map[string]bool // another write arrived while it ran: heal again
 	quarantine string
 	// quotaBytes caps the evidence kept in the quarantine directory; the
 	// oldest evidence files are pruned (and logged) past it.
@@ -70,7 +71,7 @@ func New(quarantineDir string) (*Store, error) {
 	if err := prepareQuarantine(quarantineDir); err != nil {
 		return nil, err
 	}
-	return &Store{good: map[string]snapshot{}, inflight: map[string]bool{},
+	return &Store{good: map[string]snapshot{}, inflight: map[string]bool{}, dirty: map[string]bool{},
 		quarantine: quarantineDir, quotaBytes: DefaultQuotaBytes}, nil
 }
 
@@ -131,42 +132,60 @@ func (s *Store) Watched(path string) bool {
 	return ok
 }
 
+// Result is what one Heal did.
+type Result struct {
+	Healed   bool   // the known-good content was restored over a changed file
+	Evidence string // where the tampered version was kept ("" if none or not kept)
+}
+
 // Heal saves the current (tampered) file to quarantine and atomically restores
-// the known-good content, with the original owner, group and mode. Returns the
-// quarantine path ("" when there was nothing to quarantine), or "" and nil if
-// the content already matches the snapshot. Only snapshotted files heal, and a
-// heal that cannot be done without following a symlink or writing into a
-// directory another user controls is refused with an error wrapping ErrUnsafe.
-func (s *Store) Heal(path string) (string, error) {
+// the known-good content, with the original owner, group and mode. A file
+// whose content already matches the snapshot is left alone (Healed false).
+// Only snapshotted files heal (others return a zero Result), and a heal that
+// cannot be done without following a symlink or writing into a directory
+// another user controls is refused with an error wrapping ErrUnsafe.
+func (s *Store) Heal(path string) (Result, error) {
 	path = filepath.Clean(path)
 	s.mu.Lock()
 	snap, ok := s.good[path]
 	s.mu.Unlock()
 	if !ok {
-		return "", nil
+		return Result{}, nil
 	}
 	return heal(path, snap, s.quarantine, s.quotaBytes)
 }
 
-// Claim marks a heal of path as pending and reports whether the caller got it.
-// A burst of writes to one file schedules one heal, not one per write; the
-// caller must Release when its heal is done.
+// Claim asks to heal path. It returns true if the caller now owns the heal
+// and must run it (then call Finish until Finish returns false). If a heal of
+// path is already running it returns false and marks the path dirty, so the
+// running owner heals once more after it finishes: a write that lands after
+// the running heal read the file is never lost, and a burst of writes still
+// costs at most one extra heal.
 func (s *Store) Claim(path string) bool {
 	path = filepath.Clean(path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inflight[path] {
+		s.dirty[path] = true
 		return false
 	}
 	s.inflight[path] = true
 	return true
 }
 
-// Release ends a heal claimed with Claim.
-func (s *Store) Release(path string) {
+// Finish is called by the owner after each heal of path. It returns true
+// (keeping ownership, clearing the dirty bit) if another write was claimed
+// meanwhile and the owner must heal again; otherwise it releases the path.
+func (s *Store) Finish(path string) bool {
+	path = filepath.Clean(path)
 	s.mu.Lock()
-	delete(s.inflight, filepath.Clean(path))
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty[path] {
+		delete(s.dirty, path)
+		return true
+	}
+	delete(s.inflight, path)
+	return false
 }
 
 func sanitize(p string) string {

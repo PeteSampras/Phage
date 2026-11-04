@@ -66,8 +66,12 @@ type App struct {
 	// (swappable in tests).
 	selfPID int32
 	getppid func() int
-	proc    procView      // /proc reads (fake in tests)
-	sshd    *sshdIdentity // host sshd binaries by inode
+	proc    procView // /proc reads (fake in tests)
+
+	healGate  func(v procView, pid int32, path string) (bool, string) // writer-view check before a heal
+	healDelay func()                                                  // pause before a heal (the write lands)
+	healWG    sync.WaitGroup                                          // running heals (tests wait on it)
+	sshd      *sshdIdentity                                           // host sshd binaries by inode
 
 	started time.Time
 	// counters and the recent-alerts ring back the control interface.
@@ -130,6 +134,8 @@ func New(cfg config.Config, objPath string, store profile.Repository, meta Meta)
 		selfPID:     int32(os.Getpid()),
 		getppid:     os.Getppid,
 		proc:        hostProc{},
+		healGate:    writerSeesHostFile,
+		healDelay:   func() { time.Sleep(250 * time.Millisecond) },
 		sshd:        newSSHDIdentity(),
 	}
 }
@@ -287,16 +293,20 @@ func (a *App) onShutdown() error {
 // action the matrix chose. Containment (isolate/freeze) is reached only in
 // enforce mode and only above the contain threshold; alert mode yields Notify.
 func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
+	requested := want // what the response matrix judged the verdict to justify
+	reason := describe(ev, v)
+
 	// Escalation / de-dup: if this process is already contained at an equal or
-	// stronger rung, just refresh its lease and record the alert — don't
-	// re-actuate or spam the log. A strictly stronger action escalates.
+	// stronger rung, refresh its lease and don't re-actuate or spam the log —
+	// but still heal a malicious write and record the verdict: the process
+	// being contained says nothing about the file it just wrote.
 	a.contMu.Lock()
 	if st := a.contained[ev.PID]; st != nil && response.Rung(want) <= response.Rung(st.rung) {
 		st.last = time.Now()
+		rung := st.rung
 		a.contMu.Unlock()
-		a.mu.Lock()
-		a.nAlerts++
-		a.mu.Unlock()
+		reason = a.maybeHeal(ev, v, reason)
+		a.recordResponse(ev, v, requested, rung, "already_contained", reason)
 		return
 	}
 	a.contMu.Unlock()
@@ -305,8 +315,32 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if parent == "" && len(ev.Lineage) > 0 {
 		parent = ev.Lineage[0].Comm
 	}
-	requested := want // what the response matrix judged the verdict to justify
 
+	applied, outcome := a.actuate(ev, requested)
+	contained := outcome == outcomeContained
+	reason = a.maybeHeal(ev, v, reason)
+
+	// Logged and audited AFTER actuation, so the trail says what was asked
+	// for, what was done, and how it went. Every attacker-influenced string is
+	// escaped exactly once here (comm/parent with %q, the free-text reason and
+	// outcome with logsafe.Clean), so a crafted name holding a newline or control bytes
+	// cannot forge an extra journal line.
+	log.Printf("%s score=%.2f requested=%s action=%s outcome=\"%s\" pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=\"%s\"",
+		strings.ToUpper(labelFor(v.Score)), v.Score, requested, applied, logsafe.Clean(outcome),
+		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, logsafe.Clean(reason))
+	if contained {
+		a.contMu.Lock()
+		a.contained[ev.PID] = &contState{rung: applied, last: time.Now(), comm: ev.Comm}
+		a.contMu.Unlock()
+		a.mu.Lock()
+		a.nContained++
+		a.mu.Unlock()
+	}
+	a.recordResponse(ev, v, requested, applied, outcome, reason)
+}
+
+// describe builds the human reason for a verdict, raw (escaped at output).
+func describe(ev model.Event, v verdict.Verdict) string {
 	reason := reasons(v)
 	// For egress anomalies, the concrete destination is the operator's first
 	// question; keep it in the reason and the audit trail even though the IP is
@@ -323,53 +357,21 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if ev.Kind == kind.Enable && ev.EnableOp != "" {
 		reason = fmt.Sprintf("%s (op: %s)", reason, ev.EnableOp)
 	}
+	return reason
+}
 
-	applied, outcome := a.actuate(ev, requested)
-	contained := outcome == outcomeContained
-
-	// Self-heal a malicious write to a snapshotted sentinel file. Gated on the
-	// score crossing the containment threshold (the write is judged malicious),
-	// independent of the process-containment rung above.
-	if ev.Kind == kind.FileWrite && v.Score >= a.cfg.Thresholds.Contain &&
-		a.cfg.Armed(config.FeatureSelfHeal) && a.healer != nil && a.healer.Watched(ev.File.Path) {
-		// The event's path was resolved in the WRITER's mount namespace: only a
-		// writer in the host's namespace can have touched the host file we
-		// snapshotted. Checked now, while the writer is most likely alive; a
-		// writer already gone is not healed (the alert stands).
-		if ok, why := sameMountNS(a.proc, ev.PID); !ok {
-			log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
-			reason = fmt.Sprintf("%s [self-heal skipped: %s]", reason, why)
-		} else if a.healer.Claim(ev.File.Path) { // one pending heal per path, however many writes
-			go a.selfHeal(ev.File.Path)
-		}
-	}
-
-	// Logged and audited AFTER actuation, so the trail says what was asked
-	// for, what was done, and how it went. Every attacker-influenced string is
-	// escaped exactly once here (comm/parent with %q, the free-text reason and
-	// outcome with logsafe.Clean), so a crafted name holding a newline or control bytes
-	// cannot forge an extra journal line.
-	log.Printf("%s score=%.2f requested=%s action=%s outcome=\"%s\" pid=%d comm=%q parent=%q uid=%d->euid=%d interactive=%t :: reason=\"%s\"",
-		strings.ToUpper(labelFor(v.Score)), v.Score, requested, applied, logsafe.Clean(outcome),
-		ev.PID, ev.Comm, parent, ev.Creds.UID, ev.Creds.EUID, ev.Session.Interactive, logsafe.Clean(reason))
+// recordResponse writes the response audit record and the control-socket
+// alert (they always carry the same fields) and counts the alert.
+func (a *App) recordResponse(ev model.Event, v verdict.Verdict, requested, applied action.Type, outcome, reason string) {
 	if err := a.audit.Record(audit.Entry{
 		Kind: audit.KindResponse, Requested: string(requested), Action: string(applied), Outcome: outcome,
 		Score: v.Score, PID: ev.PID, Comm: ev.Comm, Reason: reason,
 	}); err != nil && err != audit.ErrDisabled {
 		log.Printf("audit: %v", err)
 	}
-
-	if contained {
-		a.contMu.Lock()
-		a.contained[ev.PID] = &contState{rung: applied, last: time.Now(), comm: ev.Comm}
-		a.contMu.Unlock()
-	}
-
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.nAlerts++
-	if contained {
-		a.nContained++
-	}
 	a.recent = append(a.recent, control.Alert{
 		Time: time.Now().UTC().Format(time.RFC3339), Score: v.Score,
 		Requested: string(requested), Action: string(applied), Outcome: outcome,
@@ -378,7 +380,31 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 	if len(a.recent) > a.recentLimit {
 		a.recent = a.recent[len(a.recent)-a.recentLimit:]
 	}
-	a.mu.Unlock()
+}
+
+// maybeHeal schedules a self-heal for a malicious write to a snapshotted
+// sentinel and returns the reason, annotated if the heal was skipped. Gated on
+// the score crossing the containment threshold (the write is judged
+// malicious), independent of any process containment.
+func (a *App) maybeHeal(ev model.Event, v verdict.Verdict, reason string) string {
+	if ev.Kind != kind.FileWrite || v.Score < a.cfg.Thresholds.Contain ||
+		!a.cfg.Armed(config.FeatureSelfHeal) || a.healer == nil || !a.healer.Watched(ev.File.Path) {
+		return reason
+	}
+	// The event's path was resolved in the WRITER's view of the filesystem.
+	// Heal only if that names the host's sentinel inode (or, writer gone, let
+	// the host file's own content decide).
+	if ok, why := a.healGate(a.proc, ev.PID, ev.File.Path); !ok {
+		log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
+		return fmt.Sprintf("%s [self-heal skipped: %s]", reason, why)
+	}
+	// One owner per path; writes during a running heal set its dirty bit, so
+	// it heals again afterwards instead of missing them.
+	if a.healer.Claim(ev.File.Path) {
+		a.healWG.Add(1)
+		go a.selfHeal(ev.File.Path, ev.PID, ev.Comm)
+	}
+	return reason
 }
 
 const (
@@ -814,17 +840,33 @@ func pidAlive(pid int32) bool {
 }
 
 // selfHeal restores a tampered sentinel file after letting the malicious write
-// land, keeping the attacker's version as evidence.
-func (a *App) selfHeal(path string) {
-	defer a.healer.Release(path)
-	time.Sleep(250 * time.Millisecond) // let the write complete, then revert it
-	q, err := a.healer.Heal(path)
-	if err != nil {
-		log.Printf("self-heal %q failed: %v", path, err)
-		return
-	}
-	if q != "" {
-		log.Printf("SELF-HEALED %q (restored known-good; attacker version saved to %q)", path, q)
+// land, keeping the attacker's version as evidence. It owns the path's claim
+// and heals again for as long as writes keep arriving during a heal. Every
+// heal is audited (kind self_heal: healed | unchanged | failed:<err>).
+func (a *App) selfHeal(path string, pid int32, comm string) {
+	defer a.healWG.Done()
+	for {
+		a.healDelay() // let the write complete, then revert it
+		res, err := a.healer.Heal(path)
+		outcome := "unchanged"
+		switch {
+		case err != nil:
+			outcome = "failed:" + err.Error()
+			log.Printf("self-heal %q failed: %v", path, err)
+		case res.Healed:
+			outcome = "healed"
+			log.Printf("SELF-HEALED %q (restored known-good; attacker version saved to %q)", path, res.Evidence)
+		}
+		if err := a.audit.Record(audit.Entry{
+			Kind: audit.KindSelfHeal, Action: audit.KindSelfHeal, Outcome: outcome,
+			PID: pid, Comm: comm, Path: path, Evidence: res.Evidence,
+			Reason: fmt.Sprintf("self-heal of %s after a malicious write: %s", path, outcome),
+		}); err != nil && err != audit.ErrDisabled {
+			log.Printf("audit: %v", err)
+		}
+		if !a.healer.Finish(path) {
+			return
+		}
 	}
 }
 

@@ -4,11 +4,13 @@ package selfheal
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -90,7 +92,8 @@ func TestHealRestoresContentAndMode(t *testing.T) {
 		mustSnapshot(t, f)
 		writeFile(t, f.target, "evil\n", 0o666)
 
-		q, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target)
+		q := res.Evidence
 		if err != nil {
 			t.Fatalf("Heal: %v", err)
 		}
@@ -119,8 +122,8 @@ func TestHealRestoresContentAndMode(t *testing.T) {
 func TestHealUnchangedIsNoop(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
-	if q, err := f.store.Heal(f.target); err != nil || q != "" {
-		t.Fatalf("Heal on an unchanged file = (%q, %v), want (\"\", nil)", q, err)
+	if res, err := f.store.Heal(f.target); err != nil || res.Healed || res.Evidence != "" {
+		t.Fatalf("Heal on an unchanged file = (%+v, %v), want a zero Result", res, err)
 	}
 }
 
@@ -175,7 +178,8 @@ func TestHealReplacesTargetSwappedForSymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		q, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target)
+		q := res.Evidence
 		if err != nil {
 			t.Fatalf("Heal: %v", err)
 		}
@@ -199,7 +203,8 @@ func TestHealRestoresOversizedTarget(t *testing.T) {
 	mustSnapshot(t, f)
 	big := strings.Repeat("A", maxSnapshot+1024)
 	writeFile(t, f.target, big, 0o640)
-	q, err := f.store.Heal(f.target)
+	res, err := f.store.Heal(f.target)
+	q := res.Evidence
 	if err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
@@ -212,16 +217,22 @@ func TestHealRestoresOversizedTarget(t *testing.T) {
 	}
 }
 
-func TestHealClaimDedups(t *testing.T) {
+func TestClaimDirtyBitReruns(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
 	if !f.store.Claim(f.target) {
 		t.Fatal("first claim must succeed")
 	}
-	if f.store.Claim(f.target) {
-		t.Fatal("a second claim while one heal is pending must be refused")
+	// Writes arriving while the heal runs: not a second owner, but a rerun.
+	if f.store.Claim(f.target) || f.store.Claim(f.target) {
+		t.Fatal("a claim while a heal is running must not hand out a second owner")
 	}
-	f.store.Release(f.target)
+	if !f.store.Finish(f.target) {
+		t.Fatal("Finish must ask the owner to heal again after a claim arrived mid-heal")
+	}
+	if f.store.Finish(f.target) {
+		t.Fatal("a burst collapses to one rerun; the second Finish must release")
+	}
 	if !f.store.Claim(f.target) {
 		t.Fatal("claim after release must succeed")
 	}
@@ -234,7 +245,8 @@ func TestQuarantineQuotaPrunesOldest(t *testing.T) {
 	var kept []string
 	for i := 0; i < 5; i++ {
 		writeFile(t, f.target, strings.Repeat("x", 1000)+string(rune('a'+i)), 0o640)
-		q, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target)
+		q := res.Evidence
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -254,6 +266,68 @@ func TestQuarantineQuotaPrunesOldest(t *testing.T) {
 	}
 	if _, err := os.Stat(kept[4]); err != nil {
 		t.Error("the newest evidence must be kept")
+	}
+}
+
+// Pruning goes by age (mtime), not by name, and leftover .stage-* files from
+// an older version are removed rather than counted as evidence.
+func TestPruneByMtimeAndCleanStaging(t *testing.T) {
+	f := newFixture(t)
+	now := time.Now()
+	files := []struct {
+		name string
+		age  time.Duration
+	}{
+		{"a-newest", 1 * time.Minute}, // name sorts first, but it is the newest
+		{"m-middle", 2 * time.Hour},
+		{"z-oldest", 5 * time.Hour}, // name sorts last, but it is the oldest
+	}
+	for _, e := range files {
+		p := filepath.Join(f.quarantine, e.name)
+		writeFile(t, p, strings.Repeat("x", 1000), 0o600)
+		ts := now.Add(-e.age)
+		os.Chtimes(p, ts, ts)
+	}
+	stage := filepath.Join(f.quarantine, ".stage-authorized_keys.0123")
+	writeFile(t, stage, strings.Repeat("s", 5000), 0o600)
+
+	qfd, err := openNoSymlinks(f.quarantine, unix.O_RDONLY|unix.O_DIRECTORY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(qfd)
+	pruneQuarantine(f.quarantine, qfd, 2000, "")
+
+	if _, err := os.Stat(stage); err == nil {
+		t.Error("leftover .stage-* file must be removed")
+	}
+	if _, err := os.Stat(filepath.Join(f.quarantine, "z-oldest")); err == nil {
+		t.Error("the oldest evidence by mtime must be pruned first")
+	}
+	for _, keep := range []string{"a-newest", "m-middle"} {
+		if _, err := os.Stat(filepath.Join(f.quarantine, keep)); err != nil {
+			t.Errorf("%s pruned; only enough of the oldest to meet the quota should go (staging must not count)", keep)
+		}
+	}
+}
+
+// The restored copy must be staged in the TARGET's directory (same fs, the
+// directory's default SELinux context), never in the quarantine dir.
+func TestHealStagesInTargetDirectory(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	writeFile(t, f.target, "evil\n", 0o640)
+	var stagedIn []string
+	stageHook = func(dirfd int, name string) {
+		dir, _ := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dirfd))
+		stagedIn = append(stagedIn, dir)
+	}
+	defer func() { stageHook = nil }()
+	if _, err := f.store.Heal(f.target); err != nil {
+		t.Fatal(err)
+	}
+	if len(stagedIn) != 1 || stagedIn[0] != f.sshDir {
+		t.Fatalf("staged in %v, want exactly the target directory %s", stagedIn, f.sshDir)
 	}
 }
 

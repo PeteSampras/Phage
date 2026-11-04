@@ -267,26 +267,26 @@ func currentEvidence(dirfd int, path string, snap snapshot) ([]byte, bool, error
 	}
 }
 
-func heal(path string, snap snapshot, quarantine string, quota int64) (string, error) {
+func heal(path string, snap snapshot, quarantine string, quota int64) (Result, error) {
 	dirfd, dst, err := openParent(path)
 	if err != nil {
-		return "", fmt.Errorf("open parent: %w", err)
+		return Result{}, fmt.Errorf("open parent: %w", err)
 	}
 	defer unix.Close(dirfd)
 	if uint64(dst.Dev) != snap.dirDev || dst.Ino != snap.dirIno {
-		return "", fmt.Errorf("%w: parent directory of %q was replaced since it was snapshotted", ErrUnsafe, path)
+		return Result{}, fmt.Errorf("%w: parent directory of %q was replaced since it was snapshotted", ErrUnsafe, path)
 	}
 	if !parentOwnerOK(dst, snap.uid) {
-		return "", fmt.Errorf("%w: parent of %q is owned by uid %d (neither root nor the file owner uid %d)",
+		return Result{}, fmt.Errorf("%w: parent of %q is owned by uid %d (neither root nor the file owner uid %d)",
 			ErrUnsafe, path, dst.Uid, snap.uid)
 	}
 
 	evidence, unchanged, err := currentEvidence(dirfd, path, snap)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
 	if unchanged {
-		return "", nil // identical to known-good; the write was benign/identical
+		return Result{}, nil // identical to known-good; the write was benign/identical
 	}
 
 	// Evidence first, in the root-only quarantine dir. Failing to keep it must
@@ -305,13 +305,16 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (string, e
 	base := filepath.Base(path)
 	tmp, err := writeExcl(dirfd, ".phage-heal-"+base, snap.content, snap.uid, snap.gid, snap.mode, snap.label)
 	if err != nil {
-		return qpath, fmt.Errorf("stage restored content: %w", err)
+		return Result{Evidence: qpath}, fmt.Errorf("stage restored content: %w", err)
+	}
+	if stageHook != nil {
+		stageHook(dirfd, tmp)
 	}
 	if err := unix.Renameat(dirfd, tmp, dirfd, base); err != nil {
 		unix.Unlinkat(dirfd, tmp, 0)
-		return qpath, fmt.Errorf("atomic restore: %w", err)
+		return Result{Evidence: qpath}, fmt.Errorf("atomic restore: %w", err)
 	}
-	return qpath, nil
+	return Result{Healed: true, Evidence: qpath}, nil
 }
 
 // saveEvidence writes one evidence file into the quarantine dir and prunes the
@@ -341,8 +344,14 @@ func saveEvidence(quarantine, path string, evidence []byte, quota int64) string 
 	return filepath.Join(quarantine, n)
 }
 
-// pruneQuarantine deletes the oldest evidence files until the directory holds
-// at most quota bytes, never deleting keep (the file just written).
+// stagePrefix names leftover staging files from an earlier version that staged
+// restored copies in the quarantine dir. They are not evidence: pruning
+// deletes them and does not count them against the quota.
+const stagePrefix = ".stage-"
+
+// pruneQuarantine deletes the oldest evidence files (by mtime) until the
+// directory holds at most quota bytes, never deleting keep (the file just
+// written).
 func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 	dup, err := unix.Dup(qfd)
 	if err != nil {
@@ -354,10 +363,10 @@ func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 	if err != nil {
 		return
 	}
-	sort.Strings(names)
 	type ent struct {
-		name string
-		size int64
+		name  string
+		size  int64
+		mtime int64
 	}
 	var ents []ent
 	var total int64
@@ -366,9 +375,21 @@ func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 		if unix.Fstatat(qfd, n, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
 			continue
 		}
-		ents = append(ents, ent{n, st.Size})
+		if strings.HasPrefix(n, stagePrefix) {
+			if unix.Unlinkat(qfd, n, 0) == nil {
+				log.Printf("self-heal: removed leftover staging file %q from quarantine", n)
+			}
+			continue
+		}
+		ents = append(ents, ent{n, st.Size, st.Mtim.Nano()})
 		total += st.Size
 	}
+	sort.Slice(ents, func(i, j int) bool {
+		if ents[i].mtime != ents[j].mtime {
+			return ents[i].mtime < ents[j].mtime
+		}
+		return ents[i].name < ents[j].name
+	})
 	for _, e := range ents {
 		if total <= quota {
 			return
@@ -382,6 +403,10 @@ func pruneQuarantine(quarantine string, qfd int, quota int64, keep string) {
 		}
 	}
 }
+
+// stageHook, when set (tests only), is told which directory fd each restored
+// copy was staged in.
+var stageHook func(dirfd int, name string)
 
 // writeExcl creates a new file in dirfd (never an existing one, never through a
 // symlink), sets owner, mode and (if given, best effort) SELinux label on the

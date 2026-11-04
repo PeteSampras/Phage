@@ -20,6 +20,7 @@ const (
 	KindStartup          = "startup"           // every start: mode, what armed, config provenance
 	KindEnforcementArmed = "enforcement_armed" // startup, when any host-modifying feature was requested
 	KindDisarmed         = "disarmed"          // startup, when a -mode downgrade switched features off
+	KindSelfHeal         = "self_heal"         // one self-heal attempt: healed | unchanged | failed:<err>
 )
 
 // Startup status values.
@@ -41,6 +42,8 @@ type Entry struct {
 	PID       int32     `json:"pid"`
 	Comm      string    `json:"comm"`
 	Reason    string    `json:"reason"`
+	Path      string    `json:"path,omitempty"`     // self_heal: the sentinel healed
+	Evidence  string    `json:"evidence,omitempty"` // self_heal: where the tampered version was kept
 
 	Status       string   `json:"status,omitempty"`
 	Mode         string   `json:"mode,omitempty"`

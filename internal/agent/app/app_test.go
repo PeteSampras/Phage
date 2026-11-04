@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AzozzALFiras/Phage/internal/agent/config"
 	"github.com/AzozzALFiras/Phage/internal/analysis/verdict"
@@ -40,7 +41,7 @@ type fakeP struct {
 	link  string
 	ppid  int32
 	uid   int
-	ns    string
+	root  string // RootFileID: "host" = the host's inode at path, "other" = a different file, "" = unreadable
 }
 
 func (f fakeProc) get(pid int32) (fakeP, error) {
@@ -56,9 +57,18 @@ func (f fakeProc) ExeID(pid int32) (fileID, uint64, string, error) {
 }
 func (f fakeProc) PPID(pid int32) (int32, error) { p, err := f.get(pid); return p.ppid, err }
 func (f fakeProc) UID(pid int32) (int, error)    { p, err := f.get(pid); return p.uid, err }
-func (f fakeProc) MntNS(pid int32) (string, error) {
+func (f fakeProc) RootFileID(pid int32, path string) (fileID, error) {
 	p, err := f.get(pid)
-	return p.ns, err
+	if err != nil {
+		return fileID{}, err
+	}
+	switch p.root {
+	case "host":
+		return lstatID(path)
+	case "other":
+		return fileID{9999, 9999}, nil
+	}
+	return fileID{}, os.ErrPermission
 }
 
 var (
@@ -70,19 +80,20 @@ var (
 // A host with a real sshd tree, an upgraded (deleted-binary) sshd, and several
 // impostors.
 var testProc = fakeProc{procs: map[int32]fakeP{
-	1:    {id: fileID{1, 1}, link: "/usr/lib/systemd/systemd", uid: 0, ns: "mnt:[1]"},
-	700:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 0, ns: "mnt:[1]"},         // listener
+	1:    {id: fileID{1, 1}, link: "/usr/lib/systemd/systemd", uid: 0},
+	700:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 0},                        // listener
 	710:  {id: sessionInode, nlink: 1, link: "/usr/lib/openssh/sshd-session", ppid: 700, uid: 0},    // [priv]
 	711:  {id: sessionInode, nlink: 1, link: "/usr/lib/openssh/sshd-session", ppid: 710, uid: 1000}, // [user]
-	500:  {id: bashInode, nlink: 1, link: "/usr/bin/bash", ppid: 711, uid: 1000, ns: "mnt:[1]"},     // login shell
+	500:  {id: bashInode, nlink: 1, link: "/usr/bin/bash", ppid: 711, uid: 1000},                    // login shell
 	702:  {id: fileID{1, 999}, nlink: 0, link: "/usr/sbin/sshd (deleted)", ppid: 1, uid: 0},         // pre-upgrade sshd
 	666:  {id: fileID{1, 555}, nlink: 1, link: "/tmp/.x/sshd", ppid: 1, uid: 0},                     // payload named sshd
 	720:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 4321, uid: 0},                     // real binary, started by a shell
 	4321: {id: bashInode, nlink: 1, link: "/usr/bin/bash", ppid: 1, uid: 0},
-	730:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 1000},                   // started by init but not root
-	667:  {id: fileID{1, 556}, nlink: 1, link: "/dev/shm/phaged", ppid: 1, uid: 0, ns: "mnt:[1]"}, // payload named phaged
-	800:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, ns: "mnt:[1]"},                          // host writer
-	801:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, ns: "mnt:[4026532999]"},                 // container writer
+	730:  {id: sshdInode, nlink: 1, link: "/usr/sbin/sshd", ppid: 1, uid: 1000},    // started by init but not root
+	667:  {id: fileID{1, 556}, nlink: 1, link: "/dev/shm/phaged", ppid: 1, uid: 0}, // payload named phaged
+	800:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, root: "host"},            // writer that sees the host file (e.g. unshare -m, no remount)
+	801:  {id: bashInode, link: "/usr/bin/bash", ppid: 1, root: "other"},           // container writer: its own copy
+	802:  {id: bashInode, link: "/usr/bin/bash", ppid: 1},                          // writer whose view is unreadable
 }}
 
 func testSSHD() *sshdIdentity {
@@ -156,15 +167,43 @@ func TestContainmentSafe(t *testing.T) {
 	}
 }
 
-func TestSameMountNS(t *testing.T) {
-	if ok, why := sameMountNS(testProc, 800); !ok {
-		t.Errorf("host writer: %s", why)
+func TestWriterSeesHostFile(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "authorized_keys")
+	os.WriteFile(host, []byte("k\n"), 0o600)
+	if ok, why := writerSeesHostFile(testProc, 800, host); !ok {
+		t.Errorf("writer resolving to the host inode (e.g. unshare -m without remounts) must heal: %s", why)
 	}
-	if ok, _ := sameMountNS(testProc, 801); ok {
-		t.Error("a writer in another mount namespace must not trigger a host heal")
+	if ok, _ := writerSeesHostFile(testProc, 801, host); ok {
+		t.Error("a writer whose path resolves to a different file must not trigger a host heal")
 	}
-	if ok, _ := sameMountNS(testProc, 31337); ok {
-		t.Error("a writer that is gone must not trigger a heal")
+	if ok, _ := writerSeesHostFile(testProc, 802, host); !ok {
+		t.Error("an unreadable writer view must fall back to the content check (heal attempted)")
+	}
+	if ok, _ := writerSeesHostFile(testProc, 31337, host); !ok {
+		t.Error("a writer that is gone must fall back to the content check (heal attempted)")
+	}
+}
+
+// The real /proc implementation: our own root is the host root, so a file
+// resolves to its own inode.
+func TestHostProcRootFileID(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	os.WriteFile(p, []byte("x"), 0o600)
+	got, err := hostProc{}.RootFileID(int32(os.Getpid()), p)
+	if err != nil {
+		t.Skipf("openat2/RESOLVE_IN_ROOT unavailable here: %v", err)
+	}
+	want, _ := lstatID(p)
+	if got != want {
+		t.Errorf("RootFileID = %+v, want %+v", got, want)
+	}
+	link := filepath.Join(filepath.Dir(p), "l")
+	os.Symlink(p, link)
+	// A trailing symlink is not followed: like the host-side lstat, it names
+	// the link itself, so a link to the host file never "matches" it.
+	lid, err := hostProc{}.RootFileID(int32(os.Getpid()), link)
+	if wantLink, _ := lstatID(link); err != nil || lid != wantLink || lid == want {
+		t.Errorf("RootFileID(link) = %+v (%v), want the link's own inode %+v", lid, err, wantLink)
 	}
 }
 
@@ -515,5 +554,146 @@ func TestArmFeaturesReportsFailures(t *testing.T) {
 	}
 	if a.netq != nil {
 		t.Error("a failed isolate loader must leave netq nil")
+	}
+}
+
+// healFixture is an enforce-mode App with self-heal armed over a real
+// snapshotted file, the scripted /proc, and no heal delay.
+type healFixture struct {
+	a      *App
+	target string
+	audit  string
+}
+
+func newHealFixture(t *testing.T) healFixture {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".ssh")
+	os.Mkdir(dir, 0o700)
+	target := filepath.Join(dir, "authorized_keys")
+	os.WriteFile(target, []byte("good\n"), 0o600)
+	h, err := selfheal.New(filepath.Join(root, "quarantine"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Snapshot(target); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Mode, cfg.Enforcement = mode.Enforce, config.Enforcement{SelfHeal: true}
+	a, path := appWithAudit(t, cfg, Meta{})
+	a.healer, a.proc, a.sshd, a.freezer = h, testProc, testSSHD(), &fakeFreezer{}
+	a.contained, a.recentLimit = map[int32]*contState{}, 100
+	a.healGate, a.healDelay = writerSeesHostFile, func() {}
+	return healFixture{a: a, target: target, audit: path}
+}
+
+func (f healFixture) write(t *testing.T, pid int32, want action.Type) {
+	t.Helper()
+	os.WriteFile(f.target, []byte("evil\n"), 0o600)
+	f.a.respond(model.Event{Kind: kind.FileWrite, PID: pid, PPID: 1, Comm: "sh",
+		File: model.FileWrite{Path: f.target}}, verdict.Verdict{Score: 0.95}, want)
+}
+
+func recordsOfKind(t *testing.T, path, k string) []audit.Entry {
+	var out []audit.Entry
+	for _, e := range readAudit(t, path) {
+		if e.Kind == k {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestSelfHealIsAudited(t *testing.T) {
+	f := newHealFixture(t)
+	f.write(t, 800, action.Notify)
+	f.a.healWG.Wait()
+	if b, _ := os.ReadFile(f.target); string(b) != "good\n" {
+		t.Fatalf("not healed: %q", b)
+	}
+	recs := recordsOfKind(t, f.audit, audit.KindSelfHeal)
+	if len(recs) != 1 {
+		t.Fatalf("self_heal records = %+v, want 1", recs)
+	}
+	r := recs[0]
+	if r.Action != "self_heal" || r.Outcome != "healed" || r.Path != f.target || r.Evidence == "" || r.PID != 800 {
+		t.Errorf("record = %+v, want action self_heal outcome healed with path and evidence", r)
+	}
+	if b, err := os.ReadFile(r.Evidence); err != nil || string(b) != "evil\n" {
+		t.Errorf("evidence %q = %q (%v)", r.Evidence, b, err)
+	}
+}
+
+func TestSelfHealFailureIsAudited(t *testing.T) {
+	f := newHealFixture(t)
+	os.Remove(f.target)
+	os.Mkdir(f.target, 0o700) // a directory cannot be restored over
+	f.a.respond(model.Event{Kind: kind.FileWrite, PID: 802, PPID: 1, Comm: "sh",
+		File: model.FileWrite{Path: f.target}}, verdict.Verdict{Score: 0.95}, action.Notify)
+	f.a.healWG.Wait()
+	recs := recordsOfKind(t, f.audit, audit.KindSelfHeal)
+	if len(recs) != 1 || !strings.HasPrefix(recs[0].Outcome, "failed:") {
+		t.Fatalf("self_heal records = %+v, want one failed:<err>", recs)
+	}
+}
+
+// The gate must be consulted: a writer whose path names a different file (its
+// own namespace's copy) must not make the agent rewrite the host file.
+func TestSelfHealSkippedForWriterOfADifferentFile(t *testing.T) {
+	f := newHealFixture(t)
+	f.write(t, 801, action.Notify)
+	f.a.healWG.Wait()
+	if b, _ := os.ReadFile(f.target); string(b) != "evil\n" {
+		t.Fatalf("host file was rewritten for a writer of a different file: %q", b)
+	}
+	if n := len(recordsOfKind(t, f.audit, audit.KindSelfHeal)); n != 0 {
+		t.Errorf("%d self_heal records; a gated-off heal must not run", n)
+	}
+	resp := recordsOfKind(t, f.audit, audit.KindResponse)
+	if len(resp) != 1 || !strings.Contains(resp[0].Reason, "self-heal skipped") {
+		t.Errorf("response reason should note the skipped heal: %+v", resp)
+	}
+}
+
+// A burst of writes during a running heal costs one extra heal (dirty bit),
+// not one heal per write — and none is lost.
+func TestSelfHealBurstIsDeduplicated(t *testing.T) {
+	f := newHealFixture(t)
+	gate := make(chan struct{})
+	f.a.healDelay = func() { <-gate }
+	for i := 0; i < 5; i++ {
+		f.write(t, 800, action.Notify)
+	}
+	close(gate)
+	f.a.healWG.Wait()
+	recs := recordsOfKind(t, f.audit, audit.KindSelfHeal)
+	if len(recs) != 2 {
+		t.Fatalf("%d heals for a burst of 5 writes, want 2 (the heal + one dirty rerun): %+v", len(recs), recs)
+	}
+	if b, _ := os.ReadFile(f.target); string(b) != "good\n" {
+		t.Fatalf("not healed: %q", b)
+	}
+}
+
+// A write by a process that is already contained still heals the file and is
+// still audited (the early de-dup return used to skip both).
+func TestAlreadyContainedWriterStillHealsAndAudits(t *testing.T) {
+	f := newHealFixture(t)
+	f.a.contained[800] = &contState{rung: action.Freeze, last: time.Now(), comm: "sh"}
+	f.write(t, 800, action.Notify)
+	f.a.healWG.Wait()
+	if b, _ := os.ReadFile(f.target); string(b) != "good\n" {
+		t.Fatalf("contained writer's write not healed: %q", b)
+	}
+	resp := recordsOfKind(t, f.audit, audit.KindResponse)
+	if len(resp) != 1 || resp[0].Outcome != "already_contained" || resp[0].Action != string(action.Freeze) {
+		t.Errorf("response records = %+v, want one already_contained record", resp)
+	}
+	if len(recordsOfKind(t, f.audit, audit.KindSelfHeal)) != 1 {
+		t.Error("the heal must be audited")
 	}
 }

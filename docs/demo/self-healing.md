@@ -31,8 +31,28 @@ is never followed or read through but is replaced; the evidence copy is
 truncated or records the symlink target. The heal is refused only if a path
 component is a symlink, the parent directory was swapped since the snapshot,
 the parent is owned by neither root nor the file's owner, or the target is now
-a directory. A burst of writes schedules one heal per file, and the quarantine
-directory is capped (64 MiB by default; oldest evidence pruned and logged).
+a directory.
+
+**Whose file was written?** The event's path is resolved in the *writer's* view
+of the filesystem, which may not be the host's (a container, or `unshare -m`).
+Comparing mount namespaces is the wrong test — `unshare -Urm sh -c 'echo k >>
+~/.ssh/authorized_keys'` is in a new namespace but still writes the host inode.
+So the agent resolves the path inside the writer's root (`/proc/<pid>/root`,
+`openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`) and heals when that is the host
+file's dev+ino. If it is a *different* file (a container's private copy), the
+host file is not touched and the alert notes the skip. If the writer has
+already exited or its view cannot be read, the heal runs and the host file's
+own content decides: it is compared with the snapshot and left alone if
+unchanged — a container's private copy cannot change it.
+
+A burst of writes costs at most one extra heal: a write that arrives while a
+heal is running marks the file dirty and the heal runs once more, so a write
+landing just after the restore read the file is not lost. Every heal attempt
+writes a `self_heal` audit record (`outcome` `healed` | `unchanged` |
+`failed:<err>`, with `path` and `evidence`). This includes writes by a
+process that is already contained. The quarantine directory is capped at 64 MiB
+by default; the oldest evidence by modification time is pruned first, and each
+prune is logged. Leftover `.stage-*` files from an older version are removed.
 
 ## The run (enforce + self-heal)
 ```
