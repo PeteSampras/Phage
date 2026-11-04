@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -59,12 +60,23 @@ func (s *Server) accept(h Handler) {
 		}
 		if err := checkPeer(conn); err != nil {
 			log.Printf("control socket: rejected connection: %v", err)
-			writeResp(conn, Response{OK: false, Error: "permission denied"})
-			conn.Close()
+			go reject(conn)
 			continue
 		}
 		go serveConn(conn, h)
 	}
+}
+
+// reject answers a disallowed peer with "permission denied". It first reads
+// (and discards, bounded) the request, so the client gets the answer rather
+// than a broken pipe from writing into an already-closed socket. Nothing it
+// sends is acted on.
+func reject(conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	var discard json.RawMessage
+	_ = json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&discard)
+	writeResp(conn, Response{OK: false, Error: "permission denied"})
 }
 
 func serveConn(conn net.Conn, h Handler) {
