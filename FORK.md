@@ -4,123 +4,180 @@ This is a hardened fork of [Phage](https://github.com/AzozzALFiras/Phage), based
 on upstream commit `9757354`. It keeps all of upstream's enforcement code
 (isolate, freeze, network quarantine, self-heal, self-protect, honeytokens,
 `phage-jail`) so that it is still available. The difference is that **nothing
-that acts on the host arms unless the operator turns it on in the config
-file.** Out of the box the fork learns, then alerts.
+that changes the host arms unless the operator turns it on explicitly in the
+config file.** Out of the box the fork learns, then alerts.
 
-Upstream's MIT `LICENSE` and copyright notice are unchanged. This file and the
-commits on top of `9757354` record what changed.
+Upstream's MIT `LICENSE` and copyright notice are unchanged. The commits on top
+of `9757354` record every change.
 
 ## Default posture
 
 | Mode | What it does |
 |---|---|
 | `learn` (default) | builds the baseline; no alerts, no actions |
-| `alert` | scores and alerts; no actions |
+| `alert` | scores and alerts; no actions (decoys only if `deception.honeytokens`) |
 | `enforce` | scores and alerts, and acts **only through the features enabled in `enforcement:`** |
 
-All five acting features are **off by default**. If none are on, `enforce`
-behaves exactly like `alert`.
+Every host-modifying feature is **off by default**:
 
-| `enforcement:` key | Acts by | Upstream armed it when |
-|---|---|---|
-| `isolate` | cutting a process's egress (eBPF cgroup network quarantine) | in any `mode: enforce` |
-| `freeze` | freezing the process tree with the cgroup freezer | in any `mode: enforce` |
-| `self_heal` | rewriting sentinel files (`authorized_keys`, cron, `ld.so.preload`) | `-heal` was given, **in any mode** |
-| `self_protect` | an eBPF-LSM program that refuses signals sent to the agent | `-protect` was given, **in any mode** |
-| `honeytokens` | creating decoy credential files | `-honeytokens` was given, **in any mode** |
+| Config key | What it changes on the host | Allowed in | Upstream armed it when |
+|---|---|---|---|
+| `enforcement.isolate` | cuts a process's egress (eBPF cgroup network quarantine) | enforce | in any `mode: enforce` |
+| `enforcement.freeze` | freezes the process tree with the cgroup freezer | enforce | in any `mode: enforce` |
+| `enforcement.self_heal` | rewrites sentinel files (`authorized_keys`, cron, `ld.so.preload`) | enforce | `-heal` was given, **in any mode** |
+| `enforcement.self_protect` | an eBPF-LSM program that refuses signals sent to the agent | enforce | `-protect` was given, **in any mode** |
+| `deception.honeytokens` | creates decoy credential files | alert, enforce | `-honeytokens` was given, **in any mode** |
 
-## Turning enforcement on
+With no `enforcement:` key on, `enforce` behaves exactly like `alert`.
 
-In `/etc/phage/phage.yaml`:
+## Turning features on
+
+These features can be enabled **only** in `/etc/phage/phage.yaml`:
 
 ```yaml
 mode: enforce
+audit_path: /var/lib/phage/audit.jsonl   # the default; required for any feature below
 enforcement:
   isolate: true
   freeze: false
   self_heal: true
   self_protect: false
+deception:
   honeytokens: false
-release_after: 300   # seconds of quiet before an isolated process is released
+release_after: 300                        # >= 1 second
 ```
 
-Then run `systemctl restart phage`. The rules:
+After editing the file, run `systemctl restart phage`.
 
-- A feature arms only when `mode: enforce` **and** its own key is `true`.
-- Phaged **refuses to start** if a feature is `true` while the mode is `learn`
-  or `alert`. This applies to the YAML keys and to the old
-  `-heal` / `-protect` / `-honeytokens` flags, which still exist as overrides
-  for those keys. It fails closed with an error that names the features
-  involved.
-- If the matrix asks for a containment rung that is not armed, the agent sends
-  an alert instead, and the reason gets a suffix such as
-  `[freeze not armed: alert only]`. If `isolate` is on but its eBPF program
-  fails to load, the agent falls back to freeze, but only when `freeze` is also
-  armed. The agent never kills.
-- Arming is loud. On startup phaged logs one line:
-  ```
-  ENFORCEMENT ARMED event=enforcement_armed mode=enforce features=isolate,self_heal failed=none pid=1234
-  ```
-  It also appends an audit record with `"kind":"enforcement_armed"`, listing
-  `features` (what armed) and `failed` (what was requested but could not arm,
-  e.g. `self_protect` on a kernel without BPF LSM). Point your SIEM at it. If
-  nothing arms, the journal says so instead. Response records now carry
-  `"kind":"response"`.
+**What the config file accepts**
+
+- Only the literal YAML values `true` and `false` are accepted. `yes`, `on`,
+  `1`, `"true"` and `True` are all rejected.
+- Phaged refuses to start if:
+  - any `enforcement:` key is on while the mode is learn or alert;
+  - `deception.honeytokens` is on while the mode is learn;
+  - any of these features is on while `audit_path` is empty.
+
+**What the command line can do**
+
+- **No command-line flag can enable a host-modifying feature.** `-heal`,
+  `-protect` and `-honeytokens` are now errors, and each error names the config
+  key that replaced the flag.
+- `-mode` can only **lower** the config file's mode. It can never raise it.
+  - `-mode enforce` without `-config` is refused.
+  - Emergency downgrade: run `phaged -config … -mode alert` (or `learn`). This
+    starts with every feature that mode does not allow switched off. It logs an
+    `ENFORCEMENT DISARMED` line and writes a `disarmed` audit record. It does
+    not fail on validation, so it cannot crash-loop.
+
+**How a containment rung falls back**
+
+- If the response matrix picks a containment rung that is not armed, the agent
+  alerts instead. The audit record shows `outcome: skipped:<feature> not armed`.
+- If isolate is armed but its eBPF program fails to load, the agent falls back
+  to freeze, but only when freeze is also armed.
+- The agent never kills a process.
+
+## What a SIEM sees
+
+All records go to the audit trail. It is on by default at
+`/var/lib/phage/audit.jsonl`, which is opened with `O_NOFOLLOW|O_CLOEXEC` and
+created 0600.
+
+- **`startup` record, on every start:** `status` (`armed` | `failed` | `none`),
+  `mode`, `features` (what armed), `failed` (requested but not armed, e.g.
+  `self_protect` without BPF LSM), `disarmed`, `config_path`, `config_sha256`
+  and `version`. Alert on `status != none`, or on an unexpected
+  `config_sha256`.
+- **When anything armed:** the log line
+  `ENFORCEMENT ARMED event=enforcement_armed status=armed mode=… features=… failed=… config_path=… config_sha256=… version=…`
+  and a matching `enforcement_armed` record. When nothing armed, the startup
+  line carries `status=` instead of the ARMED header.
+- **On a `-mode` downgrade:** a `disarmed` record.
+- **Response records**, written *after* actuation:
+  - `requested`: the rung the matrix chose;
+  - `action`: the rung actually applied;
+  - `outcome`: `contained`, `notified`, `skipped:<why>` or `failed:<err>`.
+
+  `phage events` shows the same fields.
+- **Failing to write a startup, arming or disarm record is fatal.**
 
 ## What changed and why
 
-These findings come from a read-only security review of `9757354`. Each one is
-fixed in its own commit.
+These findings come from a read-only security review of `9757354`, and from a
+design review and security audit of the first hardening round. Most findings
+are fixed across more than one commit (for example, the config gate and the
+docs moved together). `git log 9757354..` lists each commit.
 
-1. **HIGH: self-heal ran in alert mode.** `-heal` armed it in any mode, and the
-   restore fired without checking the mode. This contradicted the package doc
-   and the flag's help text, both of which said "enforce". *Fix:* acting
-   features are now gated on `mode: enforce` plus their own key (see above).
-   Docs and help text are corrected.
+1. **HIGH: self-heal ran in alert mode.** The `-heal` flag armed it in any mode.
+   *Fix:* every host-modifying feature is gated on its mode and its own config
+   key, as described above.
 2. **HIGH: self-heal could be steered into writing arbitrary files as root.**
    The restore wrote `path + ".phage-heal"` with `os.WriteFile`, which follows
-   symlinks and truncates the target, and then renamed it into place. Watched
-   files include `/home/*/.ssh/authorized_keys`, which sit in directories the
-   user owns. A local user could therefore make root overwrite
-   `/etc/shadow` or `/root/.ssh/authorized_keys`. Snapshots also followed
-   symlinks, and the original owner was lost. *Fix:* every path is resolved
-   with `openat2(RESOLVE_NO_SYMLINKS)`, or with an `O_NOFOLLOW` walk on kernels
-   without openat2. After that, all work goes through file descriptors:
-   - The parent directory must be owned by root or by the file's owner. It
-     must also have the same dev/inode it had at snapshot time.
-   - The target must be a regular file. If it has been replaced by a symlink,
-     the heal is refused rather than followed.
-   - The restored copy is created with `O_CREAT|O_EXCL|O_NOFOLLOW` in the
-     root-only 0700 quarantine directory. It is given the original uid, gid and
-     mode with `fchown`/`fchmod`, fsynced, and then `renameat`-ed into the
-     verified parent directory. If the target is on another filesystem, the
-     copy is staged the same way next to the target instead.
-   - Evidence copies are also created with `O_EXCL|O_NOFOLLOW`.
-3. **MEDIUM: trust was based on `comm`, which the attacker controls.** The
-   agent ignored file writes and honeytoken reads from any process named
-   `phaged`. It treated lethal signals from `systemd`/`init` as a supervisor
-   stop, and it never froze anything named (or parented by) `sshd`. *Fix:*
-   - The agent recognises itself by its own tgid.
-   - Only pid 1, or the launcher pid recorded at startup, counts as the
-     supervisor.
-   - sshd is recognised by `/proc/<pid>/exe` resolving to an OpenSSH server
-     binary. This includes the OpenSSH ≥ 9.8 `sshd-session` / `sshd-auth`
-     binaries, and a binary marked `(deleted)` after a package upgrade.
-4. **`-protect` and `-honeytokens` armed in any mode.** These flags, and
-   `-heal`, existed only on the command line. Because the YAML loader rejects
-   unknown keys, there was no way to set them in the config file. *Fix:* they
-   are now `enforcement:` keys, gated as above. `release_after` is now a YAML
-   key too.
-5. **LOW: control socket.** The socket was created with the process umask and
-   chmod'ed to 0600 after `Listen`, and peers were never checked, even though
-   `phage thaw` releases a contained process. *Fix:* the socket is bound under
-   umask 077, and `SO_PEERCRED` must report uid 0. Connections also get a
-   deadline.
-6. **MEDIUM: journal line forging.** The verdict log printed the reason, which
-   contains attacker-chosen file paths and executable names, with `%s`. *Fix:*
-   attacker-influenced strings are printed with `%q` (`reason="..."`), and
-   `phage events` quotes them too.
-7. **Destructive demo/bench scripts and an unpinned installer.**
+   symlinks, and the watched `/home/*/.ssh/authorized_keys` files sit in
+   directories the user owns. *Fix:*
+   - Paths are resolved with `openat2(RESOLVE_NO_SYMLINKS)`, or with an
+     `O_NOFOLLOW` walk on kernels without openat2. All later steps use file
+     descriptors.
+   - The parent directory must be owned by root or by the file's owner, and must
+     be the same dev/inode it was at snapshot time.
+   - The restored copy is created `O_CREAT|O_EXCL|O_NOFOLLOW` under a random
+     name **beside the target, through the verified parent directory fd**. This
+     means it gets the directory's default SELinux context; the snapshot's
+     `security.selinux` label is also re-applied, best effort.
+   - The copy is given the original uid, gid and mode with `fchown`/`fchmod`,
+     fsynced, and then `renameat`-ed over the target.
+   - Whatever an attacker leaves at the path (an oversized file, a symlink, a
+     FIFO) is inspected with `fstatat(AT_SYMLINK_NOFOLLOW)`. It is never
+     followed, but it is replaced. The evidence copy is truncated, or records
+     the symlink's target. Only a directory at the path is refused.
+   - Only one heal per file can be pending at a time.
+   - The quarantine directory is capped at 64 MiB. The oldest evidence is
+     pruned first, and each prune is logged.
+3. **Self-heal triggered by writes in another mount namespace.** A container
+   writing its own `/root/.ssh/authorized_keys` produced the same path as the
+   host's file. *Fix:* the writer's `/proc/<pid>/ns/mnt` must equal
+   `/proc/1/ns/mnt`. If the writer differs or has already exited, the file is
+   not healed; the alert stands, and the reason records the skip.
+4. **MEDIUM: trust was based on `comm`, which the attacker controls.**
+   - The agent now recognises itself by its own tgid.
+   - Only **pid 1** counts as the supervisor. The launcher is trusted only when
+     `dev.trust_launcher_signals: true` is set, and it is re-read with
+     `getppid` at decision time. The self-protect LSM's launcher slot is set to
+     pid 1 unless that setting is on.
+   - sshd is recognised by identity. The inode of `/proc/<pid>/exe` must be one
+     of the installed sshd binaries; these are resolved at startup, and again on
+     a miss so package upgrades are picked up. An unlinked listed binary
+     (`(deleted)`, nlink 0) also counts. In addition, the process's sshd
+     ancestry must lead to a uid-0 sshd whose parent is pid 1.
+   - A process merely *named* `sshd*` is still never contained, because
+     misjudging the real sshd would lock the operator out. It is logged as
+     `WARNING … UNVERIFIED`.
+   - The never-contain guardrail now covers isolate as well as freeze.
+5. **`-protect`, `-heal` and `-honeytokens` existed only on the command line
+   and armed in any mode.** *Fix:* they are now config keys. The flags are
+   errors.
+6. **LOW: control socket.** *Fix:*
+   - The socket is bound under umask 077, so it is never group- or
+     world-accessible.
+   - `SO_PEERCRED` must report uid 0. A rejected peer receives
+     `permission denied`, and the attempt is logged.
+   - Connections have a deadline.
+7. **MEDIUM: journal line forging.** *Fix:* attacker-influenced text is escaped
+   exactly once, at output, by `logsafe.Clean` in both the daemon log and
+   `phage events`. The audit trail stores raw values, since JSON escapes them.
+8. **Honeytokens.**
+   - They are now their own opt-in, `deception.honeytokens`, allowed in alert
+     and enforce.
+   - Decoys are created `O_EXCL|O_NOFOLLOW`.
+   - What was planted is recorded in `honeytokens.json` next to the baseline:
+     dev+ino, a content hash, and any directories created.
+   - After a crash, the next start re-adopts its own stale decoys rather than
+     treating them as real files.
+   - Removal deletes a path only if it is still the planted inode *with the
+     decoy content*, because inode numbers are reused. Created directories are
+     cleaned up.
+9. **Destructive demo/bench scripts and an unpinned installer.**
    - `scripts/bench/*` ran `rm -rf` as root and installed setuid shells.
    - `scripts/dev/proof.sh` installed a setuid shell.
    - `scripts/dev/sync.sh` rsynced the tree to the upstream author's
@@ -128,27 +185,51 @@ fixed in its own commit.
    - `scripts/install.sh` was meant to be run as `curl | sudo bash` and
      installed `releases/latest` without pinning a version.
 
-   *Fix:* `scripts/dev`, `scripts/bench` and `scripts/install.sh` are removed.
-   This fork is **built in-house from a pinned, reviewed commit** with
-   `make gen-vmlinux bpf build && sudo make install`, and never downloads
-   release artifacts. Docs that cited the removed harnesses keep upstream's
-   published results, with a note.
+   *Fix:* all of these are removed. This fork is **built in-house from a
+   pinned, reviewed commit** with `make gen-vmlinux bpf build && sudo make
+   install`, and never downloads release artifacts.
 
-The fork also makes one small related fix. Honeytoken decoys are now created
-with `O_EXCL|O_NOFOLLOW`. Upstream checked with `Stat` and then called
-`WriteFile`, which follows a dangling symlink.
+## `phage-jail` is outside the config gate
 
-## Known residuals
+`phage-jail` is a separate operator tool, and **nothing in this file gates
+it**:
+- `phage-jail lock` attaches an eBPF-LSM exec-lock to a running service for as
+  long as the command runs.
+- `phage-jail profile` writes seccomp/systemd drop-in files.
 
-- The other never-freeze names (`systemd`, `init`, `login`, `getty`,
-  `agetty`, `systemd-logind`, `dbus-daemon`, `systemd-journal`) are still
-  matched by `comm`. A payload with one of these names can still avoid a
-  freeze, though it will still raise an alert. Matching them by executable
-  path would need per-distro path lists, and a wrong list would risk freezing
-  the real process and locking the operator out, so this was left alone on
-  purpose. It only matters when `freeze` is armed.
-- `.github/workflows/release.yml` from upstream is unchanged. It runs only when
-  a tag is pushed, and nothing in this fork consumes its output.
-- The fallback that stages a heal next to the target (used when the target
-  is on another filesystem) is covered by code review only. The tests stage
-  inside a single filesystem.
+`make install` installs it alongside `phaged`. **Do not install it on a canary
+host**, or remove `/usr/local/bin/phage-jail` after `make install`, unless you
+mean to use it by hand.
+
+## Known open items
+
+- **The honeytoken kernel map is keyed on inode number only.** A file on
+  another filesystem with the same inode number would also trip the decoy alert.
+  This is an alert false-positive, not an action. Keying the map on (dev, ino)
+  needs a `sensors.bpf.c` change, plus a userspace conversion from `st_dev` to
+  the kernel's `dev_t` encoding. The objects compile here (clang, libbpf 1.3,
+  vmlinux.h from `bpftool btf dump`), but this sandbox refuses BPF loads
+  (EPERM), so the change could not be verified and was not made.
+- **Self-heal misses short-lived writers.** The mount-namespace check runs when
+  userspace processes the event, so a writer that has already exited (for
+  example `cat >> file`) is not healed; it is still alerted. Capturing the mount
+  namespace inode in-kernel would fix this, but needs a BPF change, which was
+  not made for the same reason.
+- **Snapshots are fixed at startup.** A legitimate edit to a sentinel (one that
+  scored below `contain`) is not folded into the snapshot. If a later write to
+  the same file scores high, the heal restores the *startup* content and undoes
+  the legitimate edit too; the edited version is kept as evidence. After
+  editing sentinel files on a host with self-heal armed, restart phaged.
+- **The other never-contain names are still matched by `comm`:** `systemd`,
+  `init`, `login`, `getty`, `agetty`, `systemd-logind`, `dbus-daemon` and
+  `systemd-journal`. A payload using one of these names avoids containment,
+  though it is still alerted. Unlike sshd, these have no inode check yet.
+- **SELinux.** Copying `security.selinux` is tested where the xattr can be set.
+  The restore was not run on an SELinux-enforcing host.
+- **No end-to-end run.** The full daemon could not be started here, because
+  loading the BPF programs fails in this sandbox. The startup and arming
+  records are covered by unit tests, and the flag rules were checked against
+  the built binary.
+- **Release workflow.** `.github/workflows/release.yml` from upstream is
+  unchanged. It runs only when a tag is pushed, and nothing in this fork
+  consumes its output.

@@ -226,9 +226,9 @@ It lays the pieces out like this:
 
 | Path | What |
 |---|---|
-| `/usr/local/bin/{phaged,phage,phage-jail}` | the daemon, the operator CLI, the jail tool |
+| `/usr/local/bin/{phaged,phage,phage-jail}` | the daemon, the operator CLI, the jail tool (`phage-jail` is **not** gated by the config file — do not install it on a canary; see [FORK.md](FORK.md)) |
 | `/usr/local/lib/phage/*.bpf.o` | the compiled eBPF sensors |
-| `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`, every enforcement feature off) |
+| `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`, every enforcement and deception feature off) |
 | `/etc/systemd/system/phage.service` | the systemd unit |
 | `/var/lib/phage/` | the learned baseline and the audit trail |
 
