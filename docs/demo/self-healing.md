@@ -18,6 +18,16 @@ key in a session) scores low and is never reverted. Nothing is lost; the
 attacker's version is preserved as evidence. The agent's own restore write is
 excluded, so it can't loop.
 
+Because the agent runs as root and several sentinels live in directories a
+user controls (`/home/*/.ssh`), every step is symlink-safe (this fork): paths
+are opened with `openat2(RESOLVE_NO_SYMLINKS)` (or an `O_NOFOLLOW` walk on older
+kernels), the restored copy is staged `O_CREAT|O_EXCL|O_NOFOLLOW` in the
+root-only quarantine directory and `renameat`-ed into the verified parent
+directory, the original owner/group/mode are restored with `fchown`/`fchmod`, and
+the heal is **refused** if the file or any path component is a symlink, the file
+is not a regular file, the parent directory was swapped since the snapshot, or
+the parent is owned by neither root nor the file's owner.
+
 ## The run (enforce + self-heal)
 ```
 self-heal armed: 5 sentinel file(s) snapshotted

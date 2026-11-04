@@ -200,10 +200,15 @@ func (a *App) Run(ctx context.Context) error {
 	// Self-healing: snapshot the sentinel files now, restore them after a
 	// malicious write. Only files snapshotted here are ever healed.
 	if a.cfg.Armed(config.FeatureSelfHeal) {
-		a.healer = selfheal.New("/var/lib/phage/quarantine")
-		n := a.healer.SnapshotAll(selfheal.DefaultSentinels())
-		log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
-		armed = append(armed, config.FeatureSelfHeal)
+		if h, err := selfheal.New("/var/lib/phage/quarantine"); err != nil {
+			log.Printf("self-heal: %v; running without it", err)
+			failed = append(failed, config.FeatureSelfHeal)
+		} else {
+			a.healer = h
+			n := a.healer.SnapshotAll(selfheal.DefaultSentinels())
+			log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
+			armed = append(armed, config.FeatureSelfHeal)
+		}
 	}
 
 	a.announceEnforcement(armed, failed)
