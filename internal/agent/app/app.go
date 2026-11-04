@@ -23,6 +23,7 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/audit"
 	"github.com/AzozzALFiras/Phage/internal/control"
 	"github.com/AzozzALFiras/Phage/internal/enrich"
+	"github.com/AzozzALFiras/Phage/internal/enrich/process"
 	"github.com/AzozzALFiras/Phage/internal/event/kind"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/honeytoken"
@@ -55,6 +56,13 @@ type App struct {
 	netq          *netquarantine.Manager
 	healer        *selfheal.Store
 	audit         *audit.Writer
+
+	// Identity used to trust events — never the attacker-chosen comm. selfPID is
+	// the agent's own tgid; launcherPID is the parent that started it (pid 1
+	// under systemd). exeOf resolves /proc/<pid>/exe (swappable in tests).
+	selfPID     int32
+	launcherPID int32
+	exeOf       func(pid int32) string
 
 	started time.Time
 	// counters and the recent-alerts ring back the control interface.
@@ -92,6 +100,9 @@ func New(cfg config.Config, objPath string, store profile.Repository) *App {
 		started:     time.Now(),
 		recentLimit: 100,
 		contained:   map[int32]*contState{},
+		selfPID:     int32(os.Getpid()),
+		launcherPID: int32(os.Getppid()),
+		exeOf:       process.Exe,
 	}
 }
 
@@ -260,8 +271,9 @@ func (a *App) Run(ctx context.Context) error {
 		}
 
 		// The agent's own file writes (e.g. a self-heal restore) are never a
-		// threat — don't score them, and never let them re-trigger a heal.
-		if ev.Kind == kind.FileWrite && ev.Comm == "phaged" {
+		// threat — don't score them, and never let them re-trigger a heal. The
+		// agent is recognised by its tgid: any process can name itself "phaged".
+		if ev.Kind == kind.FileWrite && a.isSelf(ev.PID) {
 			a.mu.Lock()
 			a.nEvents++
 			a.mu.Unlock()
@@ -390,7 +402,7 @@ func (a *App) respond(ev model.Event, v verdict.Verdict, want action.Type) {
 		}
 	}
 	if want == action.Freeze && a.cfg.Armed(config.FeatureFreeze) {
-		if ok, why := containmentSafe(ev); !ok {
+		if ok, why := containmentSafe(ev, a.selfPID, a.exeOf); !ok {
 			log.Printf("CONTAIN pid=%d comm=%q SKIPPED (%s) — alert only", ev.PID, ev.Comm, why)
 		} else if err := a.freezer.Freeze(ev.PID); err != nil {
 			log.Printf("CONTAIN pid=%d failed: %v", ev.PID, err)
@@ -522,10 +534,16 @@ func (a *App) Thaw(pid int32) error {
 	return a.freezer.Thaw(pid)
 }
 
-// supervisorComms may legitimately send the agent a stop signal (service
-// shutdown). A lethal signal from anything else is treated as a tamper attempt.
-var supervisorComms = map[string]bool{
-	"systemd": true, "init": true, "systemd-shutdow": true,
+// isSelf reports whether pid (a tgid, as the sensors report it) is the agent.
+func (a *App) isSelf(pid int32) bool { return pid == a.selfPID }
+
+// isSupervisor reports whether pid may legitimately send the agent a stop
+// signal: pid 1 (systemd/init, which is what `systemctl stop` and shutdown
+// signal from) or the process that launched the agent. A lethal signal from
+// anything else is a tamper attempt — whatever it calls itself; upstream
+// trusted the comm names "systemd"/"init", which any process can adopt.
+func (a *App) isSupervisor(pid int32) bool {
+	return pid == 1 || (a.launcherPID > 1 && pid == a.launcherPID)
 }
 
 // respondSelfDefense handles an attack on the agent itself. It is deliberately
@@ -533,7 +551,7 @@ var supervisorComms = map[string]bool{
 // hostile and must surface even on a thin/empty baseline. The only benign case
 // is the service supervisor sending a stop signal during shutdown.
 func (a *App) respondSelfDefense(ev model.Event) {
-	if ev.SelfDefOp != "ptrace" && supervisorComms[ev.Comm] {
+	if ev.SelfDefOp != "ptrace" && a.isSupervisor(ev.PID) {
 		return // legitimate service stop by the supervisor
 	}
 	detail := fmt.Sprintf("attempt to tamper with the Phage agent: %s by %q (pid %d) — monitor blinding/kill attempt",
@@ -551,7 +569,7 @@ func (a *App) respondSelfDefense(ev model.Event) {
 // these files, so it is a near-zero-false-positive, top-severity verdict surfaced
 // in every mode; the agent itself is excluded (it plants them).
 func (a *App) respondHoneytoken(ev model.Event) {
-	if ev.Comm == "phaged" {
+	if a.isSelf(ev.PID) {
 		return
 	}
 	detail := fmt.Sprintf("read a planted honeytoken decoy %q — near-certain credential theft / intruder snooping", ev.File.Path)
@@ -675,10 +693,37 @@ func (a *App) deadMansSwitch(ctx context.Context) {
 // because doing so could lock an operator out of the machine or wedge the
 // system. This is a deliberate hardcoded guardrail (not a learned signal) — it
 // exists because enforce mode once froze SSH logins and locked the box out.
+//
+// sshd and the agent itself are NOT here: a comm name is chosen by the process,
+// so an attacker naming their payload "sshd" would have been unfreezable. sshd
+// is recognised by its executable path (sshdExes) and the agent by its pid.
 var criticalComms = map[string]bool{
-	"sshd": true, "systemd": true, "init": true, "login": true,
+	"systemd": true, "init": true, "login": true,
 	"agetty": true, "getty": true, "systemd-logind": true,
-	"dbus-daemon": true, "phaged": true, "systemd-journal": true,
+	"dbus-daemon": true, "systemd-journal": true,
+}
+
+// sshdExes are the OpenSSH server binaries (the listener, and the per-session
+// sshd-session / sshd-auth helpers of OpenSSH >= 9.8) at their usual install
+// paths. Only a process whose /proc/<pid>/exe resolves to one of these counts
+// as sshd for the never-freeze guardrail. Writing to these paths needs root.
+var sshdExes = map[string]bool{
+	"/usr/sbin/sshd": true, "/sbin/sshd": true, "/usr/bin/sshd": true,
+	"/usr/local/sbin/sshd": true, "/usr/local/bin/sshd": true,
+	"/usr/lib/openssh/sshd-session": true, "/usr/libexec/openssh/sshd-session": true,
+	"/usr/lib/ssh/sshd-session": true, "/usr/libexec/sshd-session": true,
+	"/usr/lib/openssh/sshd-auth": true, "/usr/libexec/openssh/sshd-auth": true,
+	"/usr/lib/ssh/sshd-auth": true, "/usr/libexec/sshd-auth": true,
+}
+
+// isSSHD reports whether pid is running an OpenSSH server binary, by resolved
+// executable path. A binary replaced on disk by a package upgrade reads as
+// "<path> (deleted)" and still counts.
+func isSSHD(pid int32, exeOf func(int32) string) bool {
+	if pid <= 0 || exeOf == nil {
+		return false
+	}
+	return sshdExes[strings.TrimSuffix(exeOf(pid), " (deleted)")]
 }
 
 // containmentSafe is the HARD never-lock-out guardrail on a freeze: it refuses to
@@ -689,9 +734,17 @@ var criticalComms = map[string]bool{
 // honeytoken read, a tamper attempt), so proportionality lives there, and this
 // stays a pure safety gate. Exec/file/enable verdicts never freeze because the
 // matrix returns a lighter rung for them.
-func containmentSafe(ev model.Event) (bool, string) {
+//
+// self is the agent's own tgid; exeOf resolves a pid's executable path.
+func containmentSafe(ev model.Event, self int32, exeOf func(int32) string) (bool, string) {
 	if ev.Session.Interactive {
 		return false, "interactive login session"
+	}
+	if ev.PID == self || (ev.PPID != 0 && ev.PPID == self) {
+		return false, "the agent itself"
+	}
+	if isSSHD(ev.PID, exeOf) || isSSHD(ev.PPID, exeOf) {
+		return false, "control-plane process (sshd)"
 	}
 	if criticalComms[ev.Comm] || criticalComms[ev.ParentComm] {
 		return false, "control-plane process"
