@@ -181,6 +181,9 @@ func readSnapshot(path string) (snapshot, error) {
 		return snapshot{}, err
 	}
 	defer f.Close()
+	if sharedDir(dst) {
+		return snapshot{}, fmt.Errorf("%w: parent of %q is group- or world-writable (mode %#o)", ErrUnsafe, path, dst.Mode&0o7777)
+	}
 	if !parentOwnerOK(dst, int(st.Uid)) {
 		return snapshot{}, fmt.Errorf("%w: parent of %q is owned by uid %d (neither root nor the file owner uid %d)",
 			ErrUnsafe, path, dst.Uid, st.Uid)
@@ -267,7 +270,50 @@ func currentEvidence(dirfd int, path string, snap snapshot) ([]byte, bool, error
 	}
 }
 
-func heal(path string, snap snapshot, quarantine string, quota int64) (Result, error) {
+// sharedDir reports whether a directory is writable by anyone other than its
+// owner: group- or world-writable, sticky or not. In such a directory another
+// user can create, replace or (non-sticky) remove the sentinel between any
+// check and the restore, so it is never watched or healed. (ACLs that grant
+// write are not visible in the mode bits; see FORK.md.)
+func sharedDir(st unix.Stat_t) bool { return st.Mode&0o022 != 0 }
+
+// mayRestore is the last check before the restore, made under the verified
+// directory fd, for the uid of the (least-privileged) writer whose event
+// triggered this heal:
+//   - the directory must not have become group/world-writable;
+//   - an existing target must still be owned by the snapshot owner (never
+//     hand a file back to an old owner);
+//   - a non-root writer may only cause a restore of a file that exists and is
+//     owned by that writer (== snapshot owner): a user who could only delete
+//     or replace the file must not make root create it;
+//   - an absent target is restored only for a root writer.
+func mayRestore(dirfd int, dst unix.Stat_t, path string, snap snapshot, writerUID int) error {
+	if sharedDir(dst) {
+		return fmt.Errorf("%w: parent of %q is group- or world-writable (mode %#o)", ErrUnsafe, path, dst.Mode&0o7777)
+	}
+	var cst unix.Stat_t
+	err := unix.Fstatat(dirfd, filepath.Base(path), &cst, unix.AT_SYMLINK_NOFOLLOW)
+	switch {
+	case err == unix.ENOENT:
+		if writerUID != 0 {
+			return fmt.Errorf("%w: %q is absent and the writer (uid %d) is not root; only a root writer's event may make the agent recreate it",
+				ErrUnsafe, path, writerUID)
+		}
+		return nil
+	case err != nil:
+		return err
+	}
+	if int(cst.Uid) != snap.uid {
+		return fmt.Errorf("%w: owner of %q changed since the snapshot (uid %d then, %d now); refusing to restore the old owner",
+			ErrUnsafe, path, snap.uid, cst.Uid)
+	}
+	if writerUID != 0 && int(cst.Uid) != writerUID {
+		return fmt.Errorf("%w: %q is owned by uid %d, not by the writer (uid %d)", ErrUnsafe, path, cst.Uid, writerUID)
+	}
+	return nil
+}
+
+func heal(path string, snap snapshot, quarantine string, quota int64, writerUID int) (Result, error) {
 	dirfd, dst, err := openParent(path)
 	if err != nil {
 		return Result{}, fmt.Errorf("open parent: %w", err)
@@ -281,14 +327,8 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 			ErrUnsafe, path, dst.Uid, snap.uid)
 	}
 
-	// Never restore an old owner: if the file now belongs to someone other
-	// than its owner at snapshot time (e.g. an admin made a user's file
-	// root-owned), a heal would hand the file back to the snapshot owner along
-	// with the old content. Refuse; the caller audits it.
-	var cst unix.Stat_t
-	if err := unix.Fstatat(dirfd, filepath.Base(path), &cst, unix.AT_SYMLINK_NOFOLLOW); err == nil && int(cst.Uid) != snap.uid {
-		return Result{}, fmt.Errorf("%w: owner of %q changed since the snapshot (uid %d then, %d now); refusing to restore the old owner",
-			ErrUnsafe, path, snap.uid, cst.Uid)
+	if err := mayRestore(dirfd, dst, path, snap, writerUID); err != nil {
+		return Result{}, err
 	}
 
 	evidence, unchanged, err := currentEvidence(dirfd, path, snap)
@@ -313,6 +353,11 @@ func heal(path string, snap snapshot, quarantine string, quota int64) (Result, e
 	// make the create fail, never redirect it. renameat replaces whatever is at
 	// the target name (file, symlink, FIFO) without following it.
 	base := filepath.Base(path)
+	// Re-check right before staging: the target may have been replaced or
+	// removed while evidence was being saved.
+	if err := mayRestore(dirfd, dst, path, snap, writerUID); err != nil {
+		return Result{Evidence: qpath}, err
+	}
 	tmp, err := writeExcl(dirfd, ".phage-heal-"+base, snap.content, snap.uid, snap.gid, snap.mode, snap.label)
 	if err != nil {
 		return Result{Evidence: qpath}, fmt.Errorf("stage restored content: %w", err)
@@ -334,11 +379,11 @@ func currentOwner(path string) (int, error) {
 	}
 	defer unix.Close(dirfd)
 	var st unix.Stat_t
-	err = unix.Fstatat(dirfd, filepath.Base(path), &st, unix.AT_SYMLINK_NOFOLLOW)
-	if err == unix.ENOENT {
-		return int(dst.Uid), nil
-	}
-	if err != nil {
+	_ = dst
+	if err := unix.Fstatat(dirfd, filepath.Base(path), &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err == unix.ENOENT {
+			return -1, fmt.Errorf("%q: %w", path, os.ErrNotExist)
+		}
 		return -1, err
 	}
 	return int(st.Uid), nil

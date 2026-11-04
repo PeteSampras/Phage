@@ -92,7 +92,7 @@ func TestHealRestoresContentAndMode(t *testing.T) {
 		mustSnapshot(t, f)
 		writeFile(t, f.target, "evil\n", 0o666)
 
-		res, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target, 0)
 		q := res.Evidence
 		if err != nil {
 			t.Fatalf("Heal: %v", err)
@@ -122,7 +122,7 @@ func TestHealRestoresContentAndMode(t *testing.T) {
 func TestHealUnchangedIsNoop(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
-	if res, err := f.store.Heal(f.target); err != nil || res.Healed || res.Evidence != "" {
+	if res, err := f.store.Heal(f.target, 0); err != nil || res.Healed || res.Evidence != "" {
 		t.Fatalf("Heal on an unchanged file = (%+v, %v), want a zero Result", res, err)
 	}
 }
@@ -131,7 +131,7 @@ func TestHealRestoresDeletedFile(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
 	os.Remove(f.target)
-	if _, err := f.store.Heal(f.target); err != nil {
+	if _, err := f.store.Heal(f.target, 0); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	if got := readFile(t, f.target); got != "good\n" {
@@ -152,7 +152,7 @@ func TestHealIgnoresPlantedTempSymlink(t *testing.T) {
 		}
 		writeFile(t, f.target, "evil\n", 0o640)
 
-		if _, err := f.store.Heal(f.target); err != nil {
+		if _, err := f.store.Heal(f.target, 0); err != nil {
 			t.Fatalf("Heal: %v", err)
 		}
 		if got := readFile(t, victim); got != "root:secret\n" {
@@ -178,7 +178,7 @@ func TestHealReplacesTargetSwappedForSymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		res, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target, 0)
 		q := res.Evidence
 		if err != nil {
 			t.Fatalf("Heal: %v", err)
@@ -203,7 +203,7 @@ func TestHealRestoresOversizedTarget(t *testing.T) {
 	mustSnapshot(t, f)
 	big := strings.Repeat("A", maxSnapshot+1024)
 	writeFile(t, f.target, big, 0o640)
-	res, err := f.store.Heal(f.target)
+	res, err := f.store.Heal(f.target, 0)
 	q := res.Evidence
 	if err != nil {
 		t.Fatalf("Heal: %v", err)
@@ -220,21 +220,53 @@ func TestHealRestoresOversizedTarget(t *testing.T) {
 func TestClaimDirtyBitReruns(t *testing.T) {
 	f := newFixture(t)
 	mustSnapshot(t, f)
-	if !f.store.Claim(f.target) {
+	if !f.store.Claim(f.target, 0) {
 		t.Fatal("first claim must succeed")
 	}
 	// Writes arriving while the heal runs: not a second owner, but a rerun.
-	if f.store.Claim(f.target) || f.store.Claim(f.target) {
+	if f.store.Claim(f.target, 0) || f.store.Claim(f.target, 0) {
 		t.Fatal("a claim while a heal is running must not hand out a second owner")
 	}
-	if !f.store.Finish(f.target) {
+	if again, _ := f.store.Finish(f.target); !again {
 		t.Fatal("Finish must ask the owner to heal again after a claim arrived mid-heal")
 	}
-	if f.store.Finish(f.target) {
+	if again, _ := f.store.Finish(f.target); again {
 		t.Fatal("a burst collapses to one rerun; the second Finish must release")
 	}
-	if !f.store.Claim(f.target) {
+	if !f.store.Claim(f.target, 0) {
 		t.Fatal("claim after release must succeed")
+	}
+}
+
+// The rerun is made for the LEAST-privileged writer seen meanwhile: a
+// non-root writer's event must not be healed with root's authority because a
+// root event was also pending.
+func TestClaimRerunKeepsLeastPrivilegedWriter(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	for _, c := range []struct {
+		name    string
+		pending []int
+		want    int
+	}{
+		{"root then user", []int{0, 4242}, 4242},
+		{"user then root", []int{4242, 0}, 4242},
+		{"only root", []int{0, 0}, 0},
+		{"two different users", []int{4242, 4343}, -1},
+	} {
+		if !f.store.Claim(f.target, 0) {
+			t.Fatalf("%s: setup claim", c.name)
+		}
+		for _, uid := range c.pending {
+			f.store.Claim(f.target, uid)
+		}
+		again, uid := f.store.Finish(f.target)
+		if !again || uid != c.want {
+			t.Errorf("%s: Finish = (%v, %d), want (true, %d)", c.name, again, uid, c.want)
+		}
+		if again, _ := f.store.Finish(f.target); again {
+			t.Fatalf("%s: release", c.name)
+		}
 	}
 }
 
@@ -245,7 +277,7 @@ func TestQuarantineQuotaPrunesOldest(t *testing.T) {
 	var kept []string
 	for i := 0; i < 5; i++ {
 		writeFile(t, f.target, strings.Repeat("x", 1000)+string(rune('a'+i)), 0o640)
-		res, err := f.store.Heal(f.target)
+		res, err := f.store.Heal(f.target, 0)
 		q := res.Evidence
 		if err != nil {
 			t.Fatal(err)
@@ -323,7 +355,7 @@ func TestHealStagesInTargetDirectory(t *testing.T) {
 		stagedIn = append(stagedIn, dir)
 	}
 	defer func() { stageHook = nil }()
-	if _, err := f.store.Heal(f.target); err != nil {
+	if _, err := f.store.Heal(f.target, 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(stagedIn) != 1 || stagedIn[0] != f.sshDir {
@@ -342,7 +374,7 @@ func TestHealCopiesSELinuxLabelWhenPossible(t *testing.T) {
 	}
 	mustSnapshot(t, f)
 	writeFile(t, f.target, "evil\n", 0o640)
-	if _, err := f.store.Heal(f.target); err != nil {
+	if _, err := f.store.Heal(f.target, 0); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 256)
@@ -368,7 +400,7 @@ func TestHealRefusesParentSwappedForSymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := f.store.Heal(f.target)
+		_, err := f.store.Heal(f.target, 0)
 		if !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("Heal through a symlinked parent: err = %v, want ErrUnsafe", err)
 		}
@@ -385,7 +417,7 @@ func TestHealRefusesReplacedParentDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.MkdirAll(f.sshDir, 0o700)
-	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
+	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal into a swapped directory: err = %v, want ErrUnsafe", err)
 	}
 }
@@ -397,7 +429,7 @@ func TestHealReplacesNonRegularTarget(t *testing.T) {
 	if err := syscall.Mkfifo(f.target, 0o600); err != nil {
 		t.Skipf("mkfifo unavailable: %v", err)
 	}
-	if _, err := f.store.Heal(f.target); err != nil {
+	if _, err := f.store.Heal(f.target, 0); err != nil {
 		t.Fatalf("Heal of a FIFO: %v", err)
 	}
 	if fi, _ := os.Lstat(f.target); !fi.Mode().IsRegular() {
@@ -410,7 +442,7 @@ func TestHealRefusesDirectoryTarget(t *testing.T) {
 	mustSnapshot(t, f)
 	os.Remove(f.target)
 	os.Mkdir(f.target, 0o700)
-	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
+	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal over a directory: err = %v, want ErrUnsafe", err)
 	}
 }
@@ -482,7 +514,7 @@ func TestHealPreservesOwner(t *testing.T) {
 	writeFile(t, f.target, "evil\n", 0o666) // tampered in place: owner unchanged, mode loosened
 	os.Chown(f.target, 4242, 0)             // group changed
 
-	if _, err := f.store.Heal(f.target); err != nil {
+	if _, err := f.store.Heal(f.target, 0); err != nil {
 		t.Fatalf("Heal: %v", err)
 	}
 	var st syscall.Stat_t
@@ -502,7 +534,7 @@ func TestHealRefusesOwnerChange(t *testing.T) {
 	mustSnapshot(t, f)
 	writeFile(t, f.target, "admin-revoked-alice-key\n", 0o600)
 	os.Chown(f.target, 0, 0)
-	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
+	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal after an owner change: err = %v, want ErrUnsafe", err)
 	}
 	var st syscall.Stat_t
@@ -520,12 +552,78 @@ func TestCurrentOwner(t *testing.T) {
 	if uid, err := f.store.CurrentOwner(f.target); err != nil || uid != 4242 {
 		t.Errorf("CurrentOwner = %d, %v; want the owner now (4242), not at snapshot", uid, err)
 	}
+	// An absent file has no owner: no directory-owner fallback.
 	os.Remove(f.target)
 	os.Chown(f.sshDir, 4343, 4343)
-	if uid, err := f.store.CurrentOwner(f.target); err != nil || uid != 4343 {
-		t.Errorf("absent file: CurrentOwner = %d, %v; want the directory owner 4343", uid, err)
+	if _, err := f.store.CurrentOwner(f.target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("absent file: err = %v, want os.ErrNotExist", err)
 	}
 }
+
+// Sentinels in a group- or world-writable directory (sticky or not) are never
+// watched: another user can replace or remove them between any check and the
+// restore.
+func TestSnapshotRefusesSharedDirectory(t *testing.T) {
+	for _, m := range []os.FileMode{0o777, 0o770, 0o1777, 0o1770} {
+		f := newFixture(t)
+		os.Chmod(f.sshDir, m)
+		if err := f.store.Snapshot(f.target); !errors.Is(err, ErrUnsafe) {
+			t.Errorf("dir mode %o: Snapshot err = %v, want ErrUnsafe", m, err)
+		}
+	}
+}
+
+// ...and a directory made shared after the snapshot is re-checked at heal time.
+func TestHealRefusesDirectoryMadeSharedLater(t *testing.T) {
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	writeFile(t, f.target, "evil\n", 0o640)
+	os.Chmod(f.sshDir, 0o1777)
+	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
+		t.Fatalf("Heal in a now world-writable dir: err = %v, want ErrUnsafe", err)
+	}
+}
+
+// The writer's uid is re-checked under the verified fd: a non-root writer may
+// only cause a restore of a file that exists and is owned by it (== snapshot
+// owner); an absent file is recreated only for a root writer.
+func TestHealWriterUIDRules(t *testing.T) {
+	requireRoot(t)
+	// root-owned sentinel
+	f := newFixture(t)
+	mustSnapshot(t, f)
+	writeFile(t, f.target, "evil\n", 0o640)
+	if _, err := f.store.Heal(f.target, 4242); !errors.Is(err, ErrUnsafe) {
+		t.Errorf("uid 4242 healing a root-owned file: err = %v, want ErrUnsafe", err)
+	}
+	os.Remove(f.target)
+	if _, err := f.store.Heal(f.target, 4242); !errors.Is(err, ErrUnsafe) || exists(f.target) {
+		t.Errorf("uid 4242, absent file: err = %v, recreated=%v; want refusal", err, exists(f.target))
+	}
+	if r, err := f.store.Heal(f.target, 0); err != nil || !r.Healed {
+		t.Errorf("root writer, absent file: %+v %v; want it restored", r, err)
+	}
+
+	// user-owned sentinel in the user's own directory
+	g := newFixture(t)
+	os.Chown(g.sshDir, 4242, 4242)
+	os.Chown(g.target, 4242, 4242)
+	mustSnapshot(t, g)
+	writeFile(t, g.target, "evil\n", 0o640)
+	if r, err := g.store.Heal(g.target, 4242); err != nil || !r.Healed {
+		t.Errorf("owner healing own file: %+v %v", r, err)
+	}
+	writeFile(t, g.target, "evil\n", 0o640)
+	if _, err := g.store.Heal(g.target, 4343); !errors.Is(err, ErrUnsafe) {
+		t.Errorf("a different user healing it: err = %v, want ErrUnsafe", err)
+	}
+	os.Remove(g.target)
+	if _, err := g.store.Heal(g.target, 4242); !errors.Is(err, ErrUnsafe) || exists(g.target) {
+		t.Errorf("owner, absent file: err = %v; a non-root writer must not make root recreate it", err)
+	}
+}
+
+func exists(p string) bool { _, err := os.Lstat(p); return err == nil }
 
 func TestSnapshotRefusesParentOwnedByThirdUser(t *testing.T) {
 	requireRoot(t)
@@ -543,7 +641,7 @@ func TestHealRefusesParentChownedAfterSnapshot(t *testing.T) {
 	mustSnapshot(t, f)
 	os.Chown(f.sshDir, 4242, 4242)
 	writeFile(t, f.target, "evil\n", 0o640)
-	if _, err := f.store.Heal(f.target); !errors.Is(err, ErrUnsafe) {
+	if _, err := f.store.Heal(f.target, 0); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("Heal under a third user's dir: err = %v, want ErrUnsafe", err)
 	}
 }
@@ -557,7 +655,7 @@ func TestUserEvidenceNeverEvictsRootEvidence(t *testing.T) {
 	f.store.quotaBytes = 4000 // 2000 per pool
 	mustSnapshot(t, f)        // root-owned
 	writeFile(t, f.target, strings.Repeat("R", 1500), 0o640)
-	rootRes, err := f.store.Heal(f.target)
+	rootRes, err := f.store.Heal(f.target, 0)
 	if err != nil || rootRes.Evidence == "" {
 		t.Fatalf("root heal: %+v %v", rootRes, err)
 	}
@@ -574,7 +672,7 @@ func TestUserEvidenceNeverEvictsRootEvidence(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		writeFile(t, ukeys, strings.Repeat("u", 900)+string(rune('a'+i)), 0o600)
 		os.Chown(ukeys, 4242, 4242)
-		if _, err := f.store.Heal(ukeys); err != nil {
+		if _, err := f.store.Heal(ukeys, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

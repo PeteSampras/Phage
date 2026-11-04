@@ -238,7 +238,9 @@ func containmentSafe(ev model.Event, self int32, v procView, sshd *sshdIdentity)
 //
 //  1. The writer could have written the host file at all: its real uid in the
 //     init namespace (ev.Creds.UID) is 0 or the host file's CURRENT owner
-//     (read at decision time; the directory's owner if the file is absent).
+//     (read at decision time; currentOwner < 0 means the file is absent, and
+//     then only root qualifies). Heal re-checks this under the verified
+//     directory fd right before restoring.
 //     This is checked FIRST and on every branch. Without it, an unprivileged
 //     user in its own user+mount namespace can write a private copy at the
 //     same path (that is the event) and then remove it — rm, or umount of a
@@ -257,6 +259,10 @@ func containmentSafe(ev model.Event, self int32, v procView, sshd *sshdIdentity)
 // healed (fail safe, still alerted), and container root without a user
 // namespace remap (real uid 0) counts as root.
 func writerSeesHostFile(v procView, pid int32, path string, writerUID, currentOwner int) (bool, string) {
+	if writerUID != 0 && currentOwner < 0 {
+		return false, fmt.Sprintf("%s is absent and the writer (uid %d) is not root: only a root writer's event may make the agent recreate it (neither root nor the current owner)",
+			path, writerUID)
+	}
 	if writerUID != 0 && writerUID != currentOwner {
 		return false, fmt.Sprintf("writer uid %d is neither root nor the current owner (uid %d) of %s: it could not have written the host file",
 			writerUID, currentOwner, path)

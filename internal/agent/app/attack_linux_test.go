@@ -197,6 +197,10 @@ func TestAttackSnapshotOwnerIsNotCurrentOwner(t *testing.T) {
 	pid := spawnAttacker(t, "mount -t tmpfs t "+dir+" && echo x > "+f.target+" && rm "+f.target)
 	f.fire(pid, attackerUID)
 	f.mustStill(t, "admin-revoked-alice-key\n", "A3: the snapshot owner reverted a file she no longer owns")
+	resp := recordsOfKind(t, f.audit, "response")
+	if len(resp) != 1 || !strings.Contains(resp[0].Reason, "neither root nor the current owner") {
+		t.Errorf("A3: skip reason not recorded: %+v", resp)
+	}
 	var st syscall.Stat_t
 	if err := syscall.Lstat(f.target, &st); err != nil || st.Uid != 0 {
 		t.Errorf("A3: ownership handed back to uid %d (%v)", st.Uid, err)
@@ -235,4 +239,85 @@ func TestHealGateNotConsultedUnlessArmed(t *testing.T) {
 			t.Fatalf("mode %s without self_heal healed: %q", m, b)
 		}
 	}
+}
+
+// asAttacker runs a shell command as uid 4242 in the init namespaces (a plain
+// local user acting on the host filesystem).
+func asAttacker(t *testing.T, sh string) {
+	t.Helper()
+	u := strconv.Itoa(attackerUID)
+	if out, err := exec.Command("setpriv", "--reuid", u, "--regid", u, "--clear-groups", "sh", "-c", sh).CombinedOutput(); err != nil {
+		t.Fatalf("attacker %q: %v %s", sh, err, out)
+	}
+}
+
+// sharedDirFx: a root-owned sentinel in a root-owned directory that is 0755
+// at snapshot time (so it is watched) and is then opened up to dirMode — the
+// heal-time state the attacker exploits. During the heal delay the attacker
+// deletes the file it just planted.
+func sharedDirFx(t *testing.T, dirMode os.FileMode) attackFx {
+	t.Helper()
+	requireAttacker(t)
+	dir := filepath.Join(openDir(t), "shared")
+	os.Mkdir(dir, 0o755)
+	target := filepath.Join(dir, "sentinel.conf")
+	os.WriteFile(target, []byte("good\n"), 0o644)
+	h, err := selfheal.New(filepath.Join(t.TempDir(), "quarantine"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Snapshot(target); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(dir, dirMode)
+	cfg := config.Default()
+	cfg.Mode, cfg.Enforcement = mode.Enforce, config.Enforcement{SelfHeal: true}
+	a, path := appWithAudit(t, cfg, Meta{})
+	a.healer, a.proc, a.sshd, a.freezer = h, hostProc{}, testSSHD(), &fakeFreezer{}
+	a.contained, a.recentLimit = map[int32]*contState{}, 100
+	a.healGate = writerSeesHostFile
+	a.healDelay = func() { asAttacker(t, "rm -f "+target) } // the attacker's timed rm inside the heal delay
+	return attackFx{a, target, path}
+}
+
+func mustNotBeRecreated(t *testing.T, f attackFx) {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Lstat(f.target, &st); err == nil {
+		b, _ := os.ReadFile(f.target)
+		t.Fatalf("uid %d made phaged create %s (owner uid %d) with %q", attackerUID, f.target, st.Uid, b)
+	}
+}
+
+// R4: in a group/world-writable directory the attacker replaces the admin's
+// file with its own (so the gate sees it as the current owner), then deletes
+// it during the heal delay. The agent must not recreate a root-owned file.
+func TestAttackSharedDirReplaceThenDelete(t *testing.T) {
+	f := sharedDirFx(t, 0o777)
+	os.WriteFile(f.target, []byte("admin-later-edit\n"), 0o644)
+	asAttacker(t, "rm -f "+f.target+" && echo x > "+f.target)
+	f.fire(999999, attackerUID)
+	mustNotBeRecreated(t, f)
+}
+
+// R4: sticky (/tmp-like) directory; the admin removed the sentinel; the
+// attacker recreates it, then deletes it during the heal delay.
+func TestAttackStickyDirRecreateDeleted(t *testing.T) {
+	f := sharedDirFx(t, 0o1777)
+	os.Remove(f.target)
+	asAttacker(t, "echo x > "+f.target)
+	f.fire(999999, attackerUID)
+	mustNotBeRecreated(t, f)
+}
+
+// Rule (1) on its own, in a directory nobody else can write: the user owns
+// her sentinel, writes it, then deletes it during the heal delay. A non-root
+// writer's event must not make root recreate an absent file.
+func TestAttackOwnerDeletesDuringHeal(t *testing.T) {
+	f := newAttackFx(t, attackerUID)
+	pid := spawnAttacker(t, "true")
+	asAttacker(t, "echo x > "+f.target)
+	f.a.healDelay = func() { asAttacker(t, "rm -f "+f.target) }
+	f.fire(pid, attackerUID)
+	mustNotBeRecreated(t, f)
 }

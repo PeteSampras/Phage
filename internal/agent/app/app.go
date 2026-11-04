@@ -394,7 +394,13 @@ func (a *App) maybeHeal(ev model.Event, v verdict.Verdict, reason string) string
 	// The event's path was resolved in the WRITER's view of the filesystem.
 	// Heal only if that names the host's sentinel inode (or, writer gone, let
 	// the host file's own content decide).
+	writer := int(ev.Creds.UID)
 	owner, err := a.healer.CurrentOwner(ev.File.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		// No current owner: only a root writer's event may make root recreate
+		// the file (a user who could merely delete it must not).
+		owner, err = -1, nil
+	}
 	if err != nil {
 		why := fmt.Sprintf("cannot read the current owner of %s: %v", ev.File.Path, err)
 		log.Printf("SELF-HEAL %q SKIPPED (%s) — alert only", ev.File.Path, why)
@@ -406,9 +412,9 @@ func (a *App) maybeHeal(ev model.Event, v verdict.Verdict, reason string) string
 	}
 	// One owner per path; writes during a running heal set its dirty bit, so
 	// it heals again afterwards instead of missing them.
-	if a.healer.Claim(ev.File.Path) {
+	if a.healer.Claim(ev.File.Path, writer) {
 		a.healWG.Add(1)
-		go a.selfHeal(ev.File.Path, ev.PID, ev.Comm)
+		go a.selfHeal(ev.File.Path, ev.PID, ev.Comm, writer)
 	}
 	return reason
 }
@@ -851,11 +857,14 @@ func pidAlive(pid int32) bool {
 // land, keeping the attacker's version as evidence. It owns the path's claim
 // and heals again for as long as writes keep arriving during a heal. Every
 // heal is audited (kind self_heal: healed | unchanged | failed:<err>).
-func (a *App) selfHeal(path string, pid int32, comm string) {
+func (a *App) selfHeal(path string, pid int32, comm string, writerUID int) {
 	defer a.healWG.Done()
 	for {
 		a.healDelay() // let the write complete, then revert it
-		res, err := a.healer.Heal(path)
+		// Heal re-checks the writer uid under the verified directory fd right
+		// before restoring (the file may have been replaced or removed since
+		// the gate looked).
+		res, err := a.healer.Heal(path, writerUID)
 		outcome := "unchanged"
 		switch {
 		case err != nil:
@@ -872,9 +881,11 @@ func (a *App) selfHeal(path string, pid int32, comm string) {
 		}); err != nil && err != audit.ErrDisabled {
 			log.Printf("audit: %v", err)
 		}
-		if !a.healer.Finish(path) {
+		again, next := a.healer.Finish(path)
+		if !again {
 			return
 		}
+		writerUID = next // the least-privileged writer among the events claimed meanwhile
 	}
 }
 

@@ -41,6 +41,7 @@ type Store struct {
 	good       map[string]snapshot
 	inflight   map[string]bool // a heal is running for this path
 	dirty      map[string]bool // another write arrived while it ran: heal again
+	pending    map[string]int  // least-privileged writer uid among those dirty events
 	quarantine string
 	// quotaBytes caps the evidence kept in the quarantine directory; the
 	// oldest evidence files are pruned (and logged) past it.
@@ -71,7 +72,7 @@ func New(quarantineDir string) (*Store, error) {
 	if err := prepareQuarantine(quarantineDir); err != nil {
 		return nil, err
 	}
-	return &Store{good: map[string]snapshot{}, inflight: map[string]bool{}, dirty: map[string]bool{},
+	return &Store{good: map[string]snapshot{}, inflight: map[string]bool{}, dirty: map[string]bool{}, pending: map[string]int{},
 		quarantine: quarantineDir, quotaBytes: DefaultQuotaBytes}, nil
 }
 
@@ -139,12 +140,16 @@ type Result struct {
 }
 
 // Heal saves the current (tampered) file to quarantine and atomically restores
-// the known-good content, with the original owner, group and mode. A file
-// whose content already matches the snapshot is left alone (Healed false).
-// Only snapshotted files heal (others return a zero Result), and a heal that
-// cannot be done without following a symlink or writing into a directory
-// another user controls is refused with an error wrapping ErrUnsafe.
-func (s *Store) Heal(path string) (Result, error) {
+// the known-good content, with the original owner, group and mode. writerUID
+// is the (least-privileged) real uid of the writer(s) whose event triggered
+// the heal; under the verified directory fd, just before the restore, a
+// non-root writer may only heal a file that exists and is owned by that
+// writer and the snapshot owner, and an absent file is recreated only for a
+// root writer (see mayRestore). A file whose content already matches the
+// snapshot is left alone (Healed false). Only snapshotted files heal (others
+// return a zero Result), and a heal that cannot be done safely is refused
+// with an error wrapping ErrUnsafe.
+func (s *Store) Heal(path string, writerUID int) (Result, error) {
 	path = filepath.Clean(path)
 	s.mu.Lock()
 	snap, ok := s.good[path]
@@ -152,52 +157,75 @@ func (s *Store) Heal(path string) (Result, error) {
 	if !ok {
 		return Result{}, nil
 	}
-	return heal(path, snap, s.quarantine, s.quotaBytes)
+	return heal(path, snap, s.quarantine, s.quotaBytes, writerUID)
 }
 
 // CurrentOwner returns the uid that owns path NOW, read without following a
-// symlink through the verified parent directory (the directory's owner if the
-// file is absent: whoever could have removed it). The self-heal gate uses it
-// to decide whether a writer could have written the host file at all; the
-// snapshot owner must never be used for that, because ownership can change
-// after the snapshot.
+// symlink through the verified parent directory. An absent file is an error
+// wrapping os.ErrNotExist (there is no owner; only a root writer may then
+// cause a restore). The self-heal gate uses it to decide whether a writer
+// could have written the host file at all; the snapshot owner must never be
+// used for that, because ownership can change after the snapshot.
 func (s *Store) CurrentOwner(path string) (int, error) {
 	return currentOwner(filepath.Clean(path))
 }
 
-// Claim asks to heal path. It returns true if the caller now owns the heal
-// and must run it (then call Finish until Finish returns false). If a heal of
-// path is already running it returns false and marks the path dirty, so the
+// Claim asks to heal path on behalf of a writer (its real uid). It returns
+// true if the caller now owns the heal and must run it with that uid (then
+// call Finish until Finish returns false, healing again with the uid Finish
+// returns). If a heal of path is already running it returns false, records the
+// writer (least-privileged wins) and marks the path dirty, so the
 // running owner heals once more after it finishes, so a write-open reported
 // after the running heal read the file is not lost, and a burst of events
 // still costs at most one extra heal. (The sensor reports write-OPENS, not
 // writes: data written later through an fd opened earlier raises no new
 // event and is not healed — see FORK.md.)
-func (s *Store) Claim(path string) bool {
+func (s *Store) Claim(path string, writerUID int) bool {
 	path = filepath.Clean(path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inflight[path] {
-		s.dirty[path] = true
+		if s.dirty[path] {
+			s.pending[path] = leastPrivileged(s.pending[path], writerUID)
+		} else {
+			s.dirty[path], s.pending[path] = true, writerUID
+		}
 		return false
 	}
 	s.inflight[path] = true
 	return true
 }
 
+// leastPrivileged merges two writer uids for one heal: a non-root uid wins
+// over root, and two different non-root uids merge to -1, which owns no file,
+// so mayRestore refuses the rerun.
+func leastPrivileged(a, b int) int {
+	switch {
+	case a == 0:
+		return b
+	case b == 0 || a == b:
+		return a
+	default:
+		return -1
+	}
+}
+
 // Finish is called by the owner after each heal of path. It returns true
-// (keeping ownership, clearing the dirty bit) if another write was claimed
-// meanwhile and the owner must heal again; otherwise it releases the path.
-func (s *Store) Finish(path string) bool {
+// (keeping ownership, clearing the dirty bit) with the least-privileged writer
+// uid seen among the events claimed meanwhile, if the owner must heal again;
+// otherwise it releases the path.
+func (s *Store) Finish(path string) (bool, int) {
 	path = filepath.Clean(path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.dirty[path] {
+		uid := s.pending[path]
 		delete(s.dirty, path)
-		return true
+		delete(s.pending, path)
+		return true, uid
 	}
 	delete(s.inflight, path)
-	return false
+	return false, 0
 }
 
 func sanitize(p string) string {
