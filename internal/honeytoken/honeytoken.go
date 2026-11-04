@@ -29,17 +29,23 @@ var Decoys = []decoy{
 // files are left untouched and not treated as decoys.
 func Seed() (paths []string, inodes []uint64) {
 	for _, d := range Decoys {
-		if _, err := os.Stat(d.path); err == nil {
-			continue // a real file lives here; never overwrite it
+		if _, err := os.Lstat(d.path); err == nil {
+			continue // a real file (or a link) lives here; never overwrite it
 		}
 		if err := os.MkdirAll(filepath.Dir(d.path), 0o700); err != nil {
 			continue
 		}
-		if err := os.WriteFile(d.path, []byte(d.content), 0o600); err != nil {
+		// O_EXCL|O_NOFOLLOW: create only a brand-new file, never write through a
+		// symlink or into a file that appeared since the Lstat above.
+		f, err := os.OpenFile(d.path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
 			continue
 		}
+		_, werr := f.WriteString(d.content)
 		var st syscall.Stat_t
-		if err := syscall.Stat(d.path, &st); err != nil {
+		serr := syscall.Fstat(int(f.Fd()), &st)
+		f.Close()
+		if werr != nil || serr != nil {
 			os.Remove(d.path)
 			continue
 		}
