@@ -155,12 +155,22 @@ func (s *Store) Heal(path string) (Result, error) {
 	return heal(path, snap, s.quarantine, s.quotaBytes)
 }
 
+// Owner returns the uid that owned path when it was snapshotted.
+func (s *Store) Owner(path string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap, ok := s.good[filepath.Clean(path)]
+	return snap.uid, ok
+}
+
 // Claim asks to heal path. It returns true if the caller now owns the heal
 // and must run it (then call Finish until Finish returns false). If a heal of
 // path is already running it returns false and marks the path dirty, so the
-// running owner heals once more after it finishes: a write that lands after
-// the running heal read the file is never lost, and a burst of writes still
-// costs at most one extra heal.
+// running owner heals once more after it finishes, so a write-open reported
+// after the running heal read the file is not lost, and a burst of events
+// still costs at most one extra heal. (The sensor reports write-OPENS, not
+// writes: data written later through an fd opened earlier raises no new
+// event and is not healed — see FORK.md.)
 func (s *Store) Claim(path string) bool {
 	path = filepath.Clean(path)
 	s.mu.Lock()

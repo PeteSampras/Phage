@@ -170,17 +170,25 @@ func TestContainmentSafe(t *testing.T) {
 func TestWriterSeesHostFile(t *testing.T) {
 	host := filepath.Join(t.TempDir(), "authorized_keys")
 	os.WriteFile(host, []byte("k\n"), 0o600)
-	if ok, why := writerSeesHostFile(testProc, 800, host); !ok {
+	const owner, user = 0, 4242
+	if ok, why := writerSeesHostFile(testProc, 800, host, user, owner); !ok {
 		t.Errorf("writer resolving to the host inode (e.g. unshare -m without remounts) must heal: %s", why)
 	}
-	if ok, _ := writerSeesHostFile(testProc, 801, host); ok {
-		t.Error("a writer whose path resolves to a different file must not trigger a host heal")
+	if ok, _ := writerSeesHostFile(testProc, 801, host, 0, owner); ok {
+		t.Error("a writer whose path resolves to a different file must not trigger a host heal, even as root")
 	}
-	if ok, _ := writerSeesHostFile(testProc, 802, host); !ok {
-		t.Error("an unreadable writer view must fall back to the content check (heal attempted)")
-	}
-	if ok, _ := writerSeesHostFile(testProc, 31337, host); !ok {
-		t.Error("a writer that is gone must fall back to the content check (heal attempted)")
+	// View unreadable (802) or writer gone (31337): only a writer that could
+	// have written the host file falls back to the content check.
+	for _, pid := range []int32{802, 31337} {
+		if ok, _ := writerSeesHostFile(testProc, pid, host, 0, owner); !ok {
+			t.Errorf("pid %d, root writer: fallback must allow the content check", pid)
+		}
+		if ok, _ := writerSeesHostFile(testProc, pid, host, user, user); !ok {
+			t.Errorf("pid %d, writer is the file owner: fallback must allow the content check", pid)
+		}
+		if ok, _ := writerSeesHostFile(testProc, pid, host, user, owner); ok {
+			t.Errorf("pid %d, unprivileged non-owner writer: fallback must NOT heal (it cannot have written the host file)", pid)
+		}
 	}
 }
 
