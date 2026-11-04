@@ -137,7 +137,8 @@ type writer interface {
 type Emitter struct {
 	w      writer
 	id     Identity
-	maxPer int // new rows per (profile, entity, bucket) before a burst row
+	maxPer int     // new rows per (status, profile, entity, bucket) before a burst row
+	exempt float64 // findings scoring at or above this are never capped (0: none)
 	logf   func(format string, args ...any)
 	now    func() time.Time
 
@@ -153,8 +154,20 @@ type Emitter struct {
 }
 
 type bucketKey struct {
-	profile, entity string
-	bucket          int64
+	status, profile, entity string
+	bucket                  int64
+}
+
+// ExemptFindingsAt exempts findings scoring at or above score (the contain
+// threshold) from the per-bucket cap: noise must never hide a near-certain
+// finding.
+func (e *Emitter) ExemptFindingsAt(score float64) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.exempt = score
+	e.mu.Unlock()
 }
 
 // maxSeen bounds the dedupe set. Past it, rows are written without dedupe
@@ -204,14 +217,21 @@ func (e *Emitter) Emit(r Row) bool {
 		e.seen[r.UID] = now
 	}
 	out := r
-	if e.maxPer > 0 {
-		k := bucketKey{r.Profile, r.Entity, r.bucket.Unix()}
+	exempt := r.Status == StatusFinding && e.exempt > 0 && r.Score != nil && *r.Score >= e.exempt
+	if e.maxPer > 0 && !exempt {
+		// Findings and unlearned rows have separate budgets, so a flood of
+		// one never hides the other.
+		k := bucketKey{r.Status, r.Profile, r.Entity, r.bucket.Unix()}
 		e.perBucket[k]++
 		switch n := e.perBucket[k]; {
 		case n == e.maxPer+1:
 			out = e.id.Burst(r, n, now)
 			e.c.OverCap++
 			e.c.Bursts++
+			if e.logf != nil {
+				e.logf("NOVELTY BURST: more than %d new %s %s rows for %s:%s in the bucket starting %s; one burst row is written and the rest only counted (heartbeat novelty_over_cap)",
+					e.maxPer, r.Status, r.Profile, r.EntityKind, r.Entity, Timestamp(r.bucket))
+			}
 		case n > e.maxPer+1:
 			e.c.OverCap++
 			e.mu.Unlock()

@@ -432,3 +432,81 @@ func TestSinkRefusesRedAndNonCanonicalLabels(t *testing.T) {
 		}
 	}
 }
+
+// N1: noise must not hide a finding. Unlearned rows exhaust their own budget;
+// a finding has a separate one, and one at or above the contain threshold is
+// never capped at all.
+func TestFindingsAreNotHiddenByUnlearnedNoise(t *testing.T) {
+	w := &failingWriter{}
+	var logged []string
+	e := NewEmitter(w, testID, 20, func(f string, a ...any) { logged = append(logged, f) })
+	e.ExemptFindingsAt(0.8)
+	now := evTime.Truncate(time.Hour)
+	e.now = func() time.Time { return now }
+	ev := events()["connect-v4"]
+	ev.Time = now
+	for port := 1; port <= 21; port++ {
+		ev.Net.DestPort = uint16(port)
+		e.Emit(testID.Unlearned(ev, []string{"k"}, testSHA, now))
+	}
+	if len(w.rows) != 21 || w.rows[20].Status != StatusBurst {
+		t.Fatalf("want 20 unlearned + 1 burst, got %d", len(w.rows))
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "NOVELTY BURST") {
+		t.Errorf("want one NOVELTY BURST line, got %q", logged)
+	}
+	now = now.Add(30 * time.Minute)
+	ev.Time, ev.Net.DestPort = now, 4444
+	high := verdict.Verdict{Score: 0.99, Reasons: []verdict.Reason{{Feature: "net.egress_comm_id", Contribution: 0.99, Detail: "c2", Confidence: 1, Samples: 99}}}
+	if !e.Emit(testID.Finding(ev, high, testSHA, now)) {
+		t.Fatal("a 0.99 finding after unlearned noise in the same bucket must be written")
+	}
+	if last := w.rows[len(w.rows)-1]; last.Status != StatusFinding || *last.Score != 0.99 {
+		t.Errorf("last row = %+v", last)
+	}
+
+	// Findings below contain have their own budget of 20, then a burst
+	// distinct from the unlearned burst; findings at/above contain pass.
+	for port := 5000; port < 5025; port++ {
+		ev.Net.DestPort = uint16(port)
+		e.Emit(testID.Finding(ev, learned(), testSHA, now)) // score 0.83 >= 0.8: exempt
+	}
+	mid := verdict.Verdict{Score: 0.5, Reasons: []verdict.Reason{{Feature: "f", Contribution: 0.5, Detail: "d", Confidence: 1}}}
+	var bursts []Row
+	for port := 6000; port < 6025; port++ {
+		ev.Net.DestPort = uint16(port)
+		e.Emit(testID.Finding(ev, mid, testSHA, now))
+	}
+	for _, r := range w.rows {
+		if r.Status == StatusBurst {
+			bursts = append(bursts, r)
+		}
+	}
+	if len(bursts) != 2 || bursts[0].UID == bursts[1].UID {
+		t.Fatalf("want separate unlearned and finding bursts with distinct uids, got %d", len(bursts))
+	}
+	if n := len(w.rows); n != 21+1+25+21 {
+		t.Errorf("rows = %d, want 21 unlearned/burst + 1 + 25 exempt + 20 findings + burst", n)
+	}
+	if !strings.Contains(bursts[1].Message, "finding") || bursts[1].Count != 21 {
+		t.Errorf("finding burst = %+v", bursts[1])
+	}
+}
+
+func TestSweepDropsFinishedBuckets(t *testing.T) {
+	e := NewEmitter(nil, testID, 2, t.Logf)
+	now := evTime
+	e.now = func() time.Time { return now }
+	ev := events()["exec"]
+	e.Emit(testID.Unlearned(ev, nil, testSHA, now))
+	if len(e.perBucket) != 1 || len(e.seen) != 1 {
+		t.Fatalf("perBucket=%d seen=%d", len(e.perBucket), len(e.seen))
+	}
+	now = now.Add(3 * time.Hour) // past two windows; a sweep is due
+	later := ev
+	later.Time = now
+	e.Emit(testID.Unlearned(later, nil, testSHA, now))
+	if len(e.perBucket) != 1 || len(e.seen) != 1 {
+		t.Errorf("finished buckets and expired uids must be swept: perBucket=%d seen=%d", len(e.perBucket), len(e.seen))
+	}
+}

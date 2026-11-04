@@ -98,3 +98,27 @@ func TestSyncDir(t *testing.T) {
 		t.Error("a missing directory must fail the save")
 	}
 }
+
+func TestSaveSyncsTheDirectoryAfterRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "baseline.json")
+	prev := syncDir
+	defer func() { syncDir = prev }()
+	var synced []string
+	syncDir = func(dir string) error {
+		if _, err := os.Stat(path); err != nil {
+			t.Error("directory synced before the rename")
+		}
+		synced = append(synced, dir)
+		return prev(dir)
+	}
+	if err := New(path).Save(baseline.NewProfile()); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != filepath.Dir(path) {
+		t.Errorf("synced %v, want [%s]", synced, filepath.Dir(path))
+	}
+	syncDir = func(string) error { return os.ErrPermission }
+	if err := New(path).Save(baseline.NewProfile()); err == nil {
+		t.Error("a failed directory sync must fail the save")
+	}
+}

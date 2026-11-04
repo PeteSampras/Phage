@@ -33,6 +33,7 @@ func (a *App) openNovelty() error {
 		log.Printf("novelty sink off (output.novelty_path unset): findings are logged and audited only")
 		// An untyped nil, not a nil *Sink: the emitter then only dedupes and caps.
 		a.novelty = novelty.NewEmitter(nil, a.ident, o.NoveltyMaxPerBucket, log.Printf)
+		a.novelty.ExemptFindingsAt(a.cfg.Thresholds.Contain)
 		return nil
 	}
 	s, err := novelty.OpenSink(o.NoveltyPath, o.NoveltyMaxBytes)
@@ -41,6 +42,7 @@ func (a *App) openNovelty() error {
 	}
 	a.sink = s
 	a.novelty = novelty.NewEmitter(s, a.ident, o.NoveltyMaxPerBucket, log.Printf)
+	a.novelty.ExemptFindingsAt(a.cfg.Thresholds.Contain)
 	log.Printf("novelty sink %s: source=%s entity=%s:%s tlp=%s, at most %d new rows per profile per %s (rows are advisory: source_kind heuristic)",
 		o.NoveltyPath, o.Source, o.EntityKind, o.Entity, o.TLP, o.NoveltyMaxPerBucket, o.NoveltyBucket)
 	return nil

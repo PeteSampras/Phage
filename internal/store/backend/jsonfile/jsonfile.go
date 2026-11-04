@@ -113,8 +113,9 @@ func (s *Store) Save(p *baseline.Profile) error {
 	return nil
 }
 
-// syncDir fsyncs a directory (its entries: a rename into it).
-func syncDir(dir string) error {
+// syncDir fsyncs a directory (its entries: a rename into it). A variable so a
+// test can prove Save calls it.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

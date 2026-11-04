@@ -178,3 +178,25 @@ func TestObservationsAndAtCap(t *testing.T) {
 		t.Error("a key that overflowed is at its cap")
 	}
 }
+
+func TestDiffOutputIsEscaped(t *testing.T) {
+	oldS := Snapshot{Counts: map[string]map[string]uint64{}, Totals: map[string]uint64{}}
+	newS := Snapshot{
+		Counts: map[string]map[string]uint64{"k\x1b[2J": {"1\nFORGED": 9}},
+		Totals: map[string]uint64{"k\x1b[2J": 9},
+	}
+	var buf bytes.Buffer
+	WriteDiff(&buf, Diff(oldS, newS), 0)
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b") || strings.Contains(out, "\nFORGED") {
+		t.Fatalf("raw control bytes in diff output: %q", out)
+	}
+	if !strings.Contains(out, `k\x1b[2J`) || !strings.Contains(out, `1\nFORGED`) {
+		t.Errorf("keys and values must be printed escaped: %q", out)
+	}
+	buf.Reset()
+	WriteSummary(&buf, newS)
+	if strings.ContainsAny(buf.String(), "\x1b") {
+		t.Errorf("raw control bytes in summary: %q", buf.String())
+	}
+}

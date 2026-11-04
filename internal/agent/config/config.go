@@ -472,7 +472,7 @@ func (o Output) validate() error {
 		if !contains(EntityKinds, o.EntityKind) {
 			return fmt.Errorf("output.entity_kind %q must be one of %s (required with output.novelty_path)", o.EntityKind, strings.Join(EntityKinds, ", "))
 		}
-		if err := ValidateEntity(o.EntityKind, o.Entity, false); err != nil {
+		if err := ValidateEntity(o.EntityKind, o.Entity); err != nil {
 			return err
 		}
 	}
@@ -508,15 +508,11 @@ func ValidateTLP(l string) error {
 	return nil
 }
 
-// ValidateEntity checks an entity's text for its kind. An empty entity is
-// allowed only when emptyOK (kind host: the host name is filled in at
-// startup). An ip must be written in canonical form (as netip prints it), the
+// ValidateEntity checks an entity's text for its kind: required, at most 512
+// bytes, no spaces or control characters, a host name in lower case. An ip must be written in canonical form (as netip prints it), the
 // form a lake profile holds, so both sources name one entity identically.
-func ValidateEntity(kind, entity string, emptyOK bool) error {
+func ValidateEntity(kind, entity string) error {
 	if entity == "" {
-		if emptyOK {
-			return nil
-		}
 		return fmt.Errorf("output.entity is required when output.entity_kind is %q", kind)
 	}
 	if len(entity) > 512 {

@@ -73,12 +73,13 @@ type Row struct {
 	Confidence  *float64 `json:"confidence,omitempty"`   // finding only
 	Support     *float64 `json:"support,omitempty"`      // times the value was learned
 	EntityTotal *float64 `json:"entity_total,omitempty"` // observations of the feature while learning
-	Count       int64    `json:"count"`                  // always 1: one row per event
+	Count       int64    `json:"count"`                  // 1 (one row per event); on a burst row, always the cap + 1
 	Message     string   `json:"message"`
 	Reasons     []string `json:"reasons"`
 	TLP         string   `json:"tlp"`
 
-	bucket time.Time // start of the uid bucket (not a column)
+	bucket  time.Time // start of the uid bucket (not a column)
+	burstOf string    // burst rows: the status they stand for (in the uid; not a column)
 }
 
 // Identity is what names this sensor and its host in every row.
@@ -219,24 +220,26 @@ func (id Identity) base(ev model.Event, status string, asOf time.Time) Row {
 	return r
 }
 
-// Burst builds the row that stands for every new row of trigger's profile
-// past the per-bucket cap: no value, no score, the count of new rows seen in
-// the bucket when the cap was passed (later ones are counted in the
-// heartbeat's novelty_over_cap, not here). Its time is the triggering
-// event's; its uid is one per profile, entity and bucket.
+// Burst builds the row that stands for every new row of trigger's status
+// (finding or unlearned) and profile past the per-bucket cap: no value, no
+// score. Its count is always the cap + 1 (the rows seen when the cap was
+// passed); the true total is not known when it is written, and the rest are
+// counted in the heartbeat's novelty_over_cap. Its time is the triggering
+// event's; its uid is one per status, profile, entity and bucket.
 func (id Identity) Burst(trigger Row, count int, asOf time.Time) Row {
 	r := trigger
+	r.burstOf = trigger.Status
 	r.Value, r.Status = "", StatusBurst
 	r.Score, r.Confidence, r.Support, r.EntityTotal = nil, nil, nil, nil
 	r.Count = int64(count)
 	r.AsOf = Timestamp(asOf)
 	r.UID = id.uid(r)
 	r.Reasons = clipAll([]string{
-		fmt.Sprintf("%d new %s rows in the bucket starting %s > novelty_max_per_bucket %d: the rest are counted, not written",
-			count, r.Profile, Timestamp(r.bucket), count-1),
+		fmt.Sprintf("more than novelty_max_per_bucket %d new %s %s rows in the bucket starting %s: count is always the cap + 1; the rest are counted in the heartbeat (novelty_over_cap), not written",
+			count-1, r.burstOf, r.Profile, Timestamp(r.bucket)),
 	}, maxReason)
-	r.Message = clip(fmt.Sprintf("%s: %d new %s rows in one bucket (a burst, such as a scan or a flood); look the values up in the audit trail (burst)",
-		r.Entity, count, r.Profile), maxMessage)
+	r.Message = clip(fmt.Sprintf("%s: more than %d new %s %s rows in one bucket (a burst, such as a scan or a flood); the total is in the heartbeat's novelty_over_cap (burst)",
+		r.Entity, count-1, r.burstOf, r.Profile), maxMessage)
 	return r
 }
 
@@ -246,7 +249,7 @@ func (id Identity) Burst(trigger Row, count int, asOf time.Time) Row {
 // often the event repeats, and a later bucket is a new row.
 func (id Identity) uid(r Row) string {
 	h := sha256.New()
-	for _, f := range []string{r.Source, r.Profile, r.Status, r.EntityKind, r.Entity, r.Value,
+	for _, f := range []string{r.Source, r.Profile, r.Status + r.burstOf, r.EntityKind, r.Entity, r.Value,
 		strconv.FormatInt(r.bucket.Unix(), 10)} {
 		h.Write([]byte(f))
 		h.Write([]byte{0})
