@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -38,14 +39,34 @@ func startServer(t *testing.T, uid uint32) (string, *fakeHandler) {
 	return path, h
 }
 
+// The socket must be created owner-only by listenPrivate itself — not merely
+// chmod'ed afterwards (which leaves a window). Run with the process umask
+// cleared, so only listenPrivate's own umask 077 can make this pass: without it
+// the socket inode is created 0777.
 func TestSocketIsOwnerOnly(t *testing.T) {
-	path, _ := startServer(t, uint32(os.Getuid()))
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	dir, err := os.MkdirTemp("", "phagectl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "phage.sock")
+	ln, err := listenPrivate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
 	fi, err := os.Lstat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		t.Errorf("socket mode = %v, want no group/other bits", perm)
+		t.Errorf("socket created with mode %v, want no group/other bits", perm)
+	}
+	if got := syscall.Umask(0); got != 0 {
+		t.Errorf("listenPrivate left the process umask at %#o; it must restore it", got)
 	}
 }
 
@@ -61,7 +82,10 @@ func TestPeerWithAllowedUIDIsServed(t *testing.T) {
 }
 
 func TestPeerWithOtherUIDIsRejected(t *testing.T) {
-	// Model an unprivileged caller by allowing a uid the test does not run as.
+	// SIMULATED: the test cannot connect as a second uid without root and a
+	// helper process, so it instead sets allowedUID to a uid it does not run
+	// as. The kernel-reported SO_PEERCRED uid (ours) then fails the check
+	// exactly as an unprivileged caller's would against the production uid 0.
 	path, h := startServer(t, uint32(os.Getuid())+12345)
 	resp, err := Do(path, Request{Cmd: "thaw", PID: 42})
 	if err != nil {

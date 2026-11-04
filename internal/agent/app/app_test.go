@@ -15,6 +15,7 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 	"github.com/AzozzALFiras/Phage/internal/policy/mode"
 	"github.com/AzozzALFiras/Phage/internal/response/action"
+	"github.com/AzozzALFiras/Phage/internal/selfheal"
 )
 
 // These tests lock in the containment safety contract. They exist because
@@ -422,5 +423,93 @@ func TestResponseRecordAfterActuation(t *testing.T) {
 				t.Errorf("phage events disagrees with the audit trail: %+v vs %+v", got, r)
 			}
 		})
+	}
+}
+
+// armFeatures must call exactly the loaders config.Armed allows — never one
+// for a feature that is off or not allowed in the current mode.
+func TestArmFeaturesArmsOnlyWhatArmedAllows(t *testing.T) {
+	all := config.Enforcement{Isolate: true, Freeze: true, SelfHeal: true, SelfProtect: true}
+	cases := []struct {
+		name string
+		m    mode.Mode
+		enf  config.Enforcement
+		ht   bool
+	}{
+		{"learn, nothing", mode.Learn, config.Enforcement{}, false},
+		{"alert, honeytokens only", mode.Alert, config.Enforcement{}, true},
+		{"alert, enforcement keys bypassing Validate", mode.Alert, all, true},
+		{"learn, everything bypassing Validate", mode.Learn, all, true},
+		{"enforce, nothing", mode.Enforce, config.Enforcement{}, false},
+		{"enforce, isolate+heal", mode.Enforce, config.Enforcement{Isolate: true, SelfHeal: true}, false},
+		{"enforce, everything", mode.Enforce, all, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Mode, cfg.Enforcement, cfg.Deception.Honeytokens = c.m, c.enf, c.ht
+			a := &App{cfg: cfg}
+			called := map[string]bool{}
+			undone := map[string]bool{}
+			ar := armers{
+				honeytokens: func() (func(), string, error) {
+					called[config.FeatureHoneytokens] = true
+					return func() { undone[config.FeatureHoneytokens] = true }, "fake", nil
+				},
+				selfProtect: func() (func(), error) {
+					called[config.FeatureSelfProtect] = true
+					return func() { undone[config.FeatureSelfProtect] = true }, nil
+				},
+				isolate: func() (isolator, func(), error) {
+					called[config.FeatureIsolate] = true
+					return &fakeIsolator{}, func() { undone[config.FeatureIsolate] = true }, nil
+				},
+				selfHeal: func() (*selfheal.Store, error) {
+					called[config.FeatureSelfHeal] = true
+					return nil, nil
+				},
+			}
+			armed, failed, disarm := a.armFeatures(ar)
+			for _, f := range []string{config.FeatureIsolate, config.FeatureSelfHeal, config.FeatureSelfProtect, config.FeatureHoneytokens} {
+				if called[f] != cfg.Armed(f) {
+					t.Errorf("%s loader called=%v, but Armed=%v", f, called[f], cfg.Armed(f))
+				}
+			}
+			var want []string
+			for _, f := range []string{config.FeatureHoneytokens, config.FeatureSelfProtect, config.FeatureIsolate, config.FeatureFreeze, config.FeatureSelfHeal} {
+				if cfg.Armed(f) {
+					want = append(want, f)
+				}
+			}
+			if strings.Join(armed, ",") != strings.Join(want, ",") || len(failed) != 0 {
+				t.Errorf("armed=%v failed=%v, want %v", armed, failed, want)
+			}
+			if (a.netq != nil) != cfg.Armed(config.FeatureIsolate) {
+				t.Errorf("netq set=%v, Armed(isolate)=%v", a.netq != nil, cfg.Armed(config.FeatureIsolate))
+			}
+			disarm()
+			for f := range called {
+				if f != config.FeatureSelfHeal && !undone[f] {
+					t.Errorf("%s armed but not disarmed by the cleanup", f)
+				}
+			}
+		})
+	}
+}
+
+func TestArmFeaturesReportsFailures(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mode, cfg.Enforcement = mode.Enforce, config.Enforcement{Isolate: true, SelfProtect: true}
+	a := &App{cfg: cfg}
+	boom := os.ErrPermission
+	armed, failed, _ := a.armFeatures(armers{
+		selfProtect: func() (func(), error) { return nil, boom },
+		isolate:     func() (isolator, func(), error) { return nil, nil, boom },
+	})
+	if len(armed) != 0 || strings.Join(failed, ",") != "self_protect,isolate" {
+		t.Errorf("armed=%v failed=%v", armed, failed)
+	}
+	if a.netq != nil {
+		t.Error("a failed isolate loader must leave netq nil")
 	}
 }

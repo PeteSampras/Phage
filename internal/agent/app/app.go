@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -168,107 +169,8 @@ func (a *App) Run(ctx context.Context) error {
 	go a.deadMansSwitch(ctx)
 	go a.releaseLoop(ctx)
 
-	// Acting features. Each arms only when mode is enforce AND its own
-	// `enforcement:` key is on (config.Armed); config.Validate already refused
-	// any other combination at startup, and Armed re-checks the mode here so a
-	// config that skipped Validate still cannot arm anything outside enforce.
-
-	// armed / failed collect what actually armed and what was requested but
-	// could not arm, for the single ENFORCEMENT ARMED line + audit record below.
-	var armed, failed []string
-
-	// Honeytokens (deception.honeytokens; alert or enforce): plant decoy
-	// credential files and alert on any read. Decoys a previous run left behind
-	// (e.g. after a crash) are re-adopted from the record next to the baseline.
-	if a.cfg.Armed(config.FeatureHoneytokens) {
-		ht := honeytoken.New(filepath.Join(filepath.Dir(a.cfg.StatePath), "honeytokens.json"), honeytoken.Decoys)
-		planted, err := ht.Seed()
-		switch {
-		case err != nil:
-			log.Printf("honeytokens: %v", err)
-			failed = append(failed, config.FeatureHoneytokens)
-		case len(planted) == 0:
-			log.Printf("honeytokens: none planted (real files at every decoy path)")
-			failed = append(failed, config.FeatureHoneytokens)
-		default:
-			if err := sensor.SetHoneytokens(honeytoken.Inodes(planted)); err != nil {
-				log.Printf("honeytokens: %v", err)
-				ht.Shutdown(planted)
-				failed = append(failed, config.FeatureHoneytokens)
-			} else {
-				defer ht.Shutdown(planted)
-				armed = append(armed, config.FeatureHoneytokens)
-				adopted := 0
-				for _, p := range planted {
-					if p.Adopted {
-						adopted++
-					}
-				}
-				log.Printf("honeytokens planted: %d decoys (%d re-adopted from a previous run) — any read of one is a high-confidence alert", len(planted), adopted)
-			}
-		}
-	}
-
-	// Tamper-resistance: deny signals that would kill the agent. Loaded as a
-	// separate eBPF-LSM object so a kernel without BPF LSM still runs the agent.
-	if a.cfg.Armed(config.FeatureSelfProtect) {
-		if !selfprotect.Available() {
-			log.Printf("self-protection requested (enforcement.self_protect) but BPF LSM is not active; running without it")
-			failed = append(failed, config.FeatureSelfProtect)
-		} else {
-			objPath := filepath.Join(filepath.Dir(a.objPath), "selfprotect.bpf.o")
-			// The LSM always allows pid 1 and the agent itself; the launcher slot
-			// gets a real pid only when dev.trust_launcher_signals says so (pid 1
-			// otherwise, which adds nothing).
-			launcher := uint32(1)
-			if a.cfg.Dev.TrustLauncherSignals {
-				launcher = uint32(os.Getppid())
-			}
-			g, err := selfprotect.Arm(objPath, uint32(os.Getpid()), launcher)
-			if err != nil {
-				log.Printf("self-protection: %v; running without it", err)
-				failed = append(failed, config.FeatureSelfProtect)
-			} else {
-				defer g.Close()
-				armed = append(armed, config.FeatureSelfProtect)
-				log.Printf("self-protection ARMED: signals that would kill the agent are denied (except from pid 1); systemctl stop and reboot still work")
-			}
-		}
-	}
-
-	// Per-process network quarantine (the reversible isolate rung used for
-	// egress/C2 verdicts). Optional: if it can't load, egress verdicts fall back
-	// to freeze — but only if freeze is armed too; otherwise they alert.
-	if a.cfg.Armed(config.FeatureIsolate) {
-		nqObj := filepath.Join(filepath.Dir(a.objPath), "netquarantine.bpf.o")
-		if nq, err := netquarantine.New(nqObj); err != nil {
-			log.Printf("network quarantine unavailable: %v (egress verdicts will freeze if freeze is armed, else alert)", err)
-			failed = append(failed, config.FeatureIsolate)
-		} else {
-			a.netq = nq
-			defer nq.Close()
-			armed = append(armed, config.FeatureIsolate)
-		}
-	}
-
-	// Freeze has nothing to load: the cgroup freezer is driven on demand.
-	if a.cfg.Armed(config.FeatureFreeze) {
-		armed = append(armed, config.FeatureFreeze)
-	}
-
-	// Self-healing: snapshot the sentinel files now, restore them after a
-	// malicious write. Only files snapshotted here are ever healed.
-	if a.cfg.Armed(config.FeatureSelfHeal) {
-		if h, err := selfheal.New("/var/lib/phage/quarantine"); err != nil {
-			log.Printf("self-heal: %v; running without it", err)
-			failed = append(failed, config.FeatureSelfHeal)
-		} else {
-			a.healer = h
-			n := a.healer.SnapshotAll(selfheal.DefaultSentinels())
-			log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
-			armed = append(armed, config.FeatureSelfHeal)
-		}
-	}
+	armed, failed, disarm := a.armFeatures(a.realArmers(sensor))
+	defer disarm()
 
 	if err := a.announceStartup(armed, failed); err != nil {
 		return err // fatal: an armed host we cannot account for must not run
@@ -524,6 +426,140 @@ func (a *App) actuate(ev model.Event, requested action.Type) (action.Type, strin
 		return action.Freeze, outcomeContained
 	}
 	return action.Notify, fmt.Sprintf("skipped:%s not armable", want)
+}
+
+// armers are the loaders for each host-modifying feature. Each returns a
+// cleanup (or the armed object) and an error. They are injected so a test can
+// prove that armFeatures calls exactly the loaders config.Armed allows.
+type armers struct {
+	honeytokens func() (cleanup func(), detail string, err error)
+	selfProtect func() (cleanup func(), err error)
+	isolate     func() (isolator, func(), error)
+	selfHeal    func() (*selfheal.Store, error)
+}
+
+// armFeatures arms every host-modifying feature config.Armed allows — and
+// nothing else — returning what armed, what was requested but failed, and one
+// cleanup that disarms everything in reverse order.
+func (a *App) armFeatures(ar armers) (armed, failed []string, disarm func()) {
+	var cleanups []func()
+	disarm = func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	note := func(feature string, err error) bool {
+		if err != nil {
+			log.Printf("%s: %v; running without it", feature, err)
+			failed = append(failed, feature)
+			return false
+		}
+		armed = append(armed, feature)
+		return true
+	}
+
+	// Honeytokens (deception.honeytokens; alert or enforce).
+	if a.cfg.Armed(config.FeatureHoneytokens) {
+		c, detail, err := ar.honeytokens()
+		if note(config.FeatureHoneytokens, err) {
+			cleanups = append(cleanups, c)
+			log.Printf("honeytokens planted: %s — any read of one is a high-confidence alert", detail)
+		}
+	}
+	// Tamper-resistance (enforcement.self_protect).
+	if a.cfg.Armed(config.FeatureSelfProtect) {
+		c, err := ar.selfProtect()
+		if note(config.FeatureSelfProtect, err) {
+			cleanups = append(cleanups, c)
+			log.Printf("self-protection ARMED: signals that would kill the agent are denied (except from pid 1); systemctl stop and reboot still work")
+		}
+	}
+	// Network quarantine (enforcement.isolate). If it cannot load, egress
+	// verdicts fall back to freeze only when freeze is armed too.
+	if a.cfg.Armed(config.FeatureIsolate) {
+		nq, c, err := ar.isolate()
+		if note(config.FeatureIsolate, err) {
+			a.netq = nq
+			cleanups = append(cleanups, c)
+		}
+	}
+	// Freeze (enforcement.freeze) has nothing to load: the cgroup freezer is
+	// driven on demand.
+	if a.cfg.Armed(config.FeatureFreeze) {
+		armed = append(armed, config.FeatureFreeze)
+	}
+	// Self-heal (enforcement.self_heal): snapshot the sentinels now.
+	if a.cfg.Armed(config.FeatureSelfHeal) {
+		h, err := ar.selfHeal()
+		if note(config.FeatureSelfHeal, err) {
+			a.healer = h
+		}
+	}
+	return armed, failed, disarm
+}
+
+// realArmers are the production loaders.
+func (a *App) realArmers(sensor *loader.Sensor) armers {
+	objDir := filepath.Dir(a.objPath)
+	return armers{
+		honeytokens: func() (func(), string, error) {
+			// Decoys a previous run left behind (e.g. after a crash) are
+			// re-adopted from the record next to the baseline.
+			ht := honeytoken.New(filepath.Join(filepath.Dir(a.cfg.StatePath), "honeytokens.json"), honeytoken.Decoys)
+			planted, err := ht.Seed()
+			if err != nil {
+				return nil, "", err
+			}
+			if len(planted) == 0 {
+				return nil, "", errors.New("none planted (real files at every decoy path)")
+			}
+			if err := sensor.SetHoneytokens(honeytoken.Inodes(planted)); err != nil {
+				ht.Shutdown(planted)
+				return nil, "", err
+			}
+			adopted := 0
+			for _, p := range planted {
+				if p.Adopted {
+					adopted++
+				}
+			}
+			return func() { ht.Shutdown(planted) },
+				fmt.Sprintf("%d decoys (%d re-adopted from a previous run)", len(planted), adopted), nil
+		},
+		selfProtect: func() (func(), error) {
+			if !selfprotect.Available() {
+				return nil, errors.New("BPF LSM is not active")
+			}
+			// The LSM always allows pid 1 and the agent itself; the launcher
+			// slot gets a real pid only when dev.trust_launcher_signals says so
+			// (pid 1 otherwise, which adds nothing).
+			launcher := uint32(1)
+			if a.cfg.Dev.TrustLauncherSignals {
+				launcher = uint32(os.Getppid())
+			}
+			g, err := selfprotect.Arm(filepath.Join(objDir, "selfprotect.bpf.o"), uint32(os.Getpid()), launcher)
+			if err != nil {
+				return nil, err
+			}
+			return func() { g.Close() }, nil
+		},
+		isolate: func() (isolator, func(), error) {
+			nq, err := netquarantine.New(filepath.Join(objDir, "netquarantine.bpf.o"))
+			if err != nil {
+				return nil, nil, fmt.Errorf("network quarantine unavailable: %w (egress verdicts will freeze if freeze is armed, else alert)", err)
+			}
+			return nq, func() { nq.Close() }, nil
+		},
+		selfHeal: func() (*selfheal.Store, error) {
+			h, err := selfheal.New("/var/lib/phage/quarantine")
+			if err != nil {
+				return nil, err
+			}
+			n := h.SnapshotAll(selfheal.DefaultSentinels())
+			log.Printf("self-heal armed: %d sentinel file(s) snapshotted (restored on malicious write)", n)
+			return h, nil
+		},
+	}
 }
 
 // announceStartup makes every start accountable. It logs one structured
