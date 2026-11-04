@@ -202,10 +202,18 @@ docs moved together). `git log 9757354..` lists each commit.
      init namespace is 0 or the file's **current** owner, read at decision
      time through the verified directory. An absent file has no owner, so
      only a root writer qualifies. The gate checks this before the inode
-     comparison, and Heal re-checks it under the verified directory fd right
-     before restoring. At that point a non-root writer may restore only a
-     file that exists and is owned by that writer and by the snapshot owner;
-     an absent file is recreated only for a root writer. When several events
+     comparison.
+     Heal re-checks the uid under the verified directory fd before staging
+     the restored copy. At that point a non-root writer may restore only a
+     file that exists and is owned by that writer and by the snapshot owner,
+     and an absent file is recreated only for a root writer. The check is
+     made **before staging, not atomically with the rename**: in her own
+     directory the owner can still race the rename, for example by deleting
+     the file or swapping the staged copy after the check. That can only
+     restore *her own* file, with *her own* snapshot content and ownership,
+     so she gains nothing she could not do directly. The audit record can
+     then say `healed` even though she swapped the staged copy, so treat
+     `healed` on a user-owned sentinel as best-effort. When several events
      are folded into one rerun (the dirty bit), the least-privileged writer's
      uid is used: non-root wins over root, and two different non-root uids
      refuse.
@@ -332,10 +340,12 @@ mean to use it by hand.
   - **Wrong heal.** The reverse trick (write a private copy, then unmount or
     remove it) can still cause a wrong heal, but since round 4 only for a
     writer whose uid is root (including container root without a userns
-    remap) or the file's current owner. Since round 5, a non-root writer can
-    no longer make the agent recreate a missing file, and the uid is
-    re-checked just before the restore. An unprivileged non-owner is refused
-    by the gate and again by Heal.
+    remap) or the file's current owner. Since round 5 the uid is re-checked
+    before staging, and a missing file is recreated only for a root writer's
+    event. In her own directory, the owner can still race the rename after
+    that check; this only restores her own file with her own snapshot
+    content. An unprivileged non-owner is refused by the gate and again by
+    Heal.
 
   Both disappear once the sensor records the dev+ino of the opened inode
   (`file->f_inode`), and the euid/fsuid, in-kernel. That needs a BPF change,

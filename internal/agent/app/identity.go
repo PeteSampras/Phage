@@ -240,7 +240,8 @@ func containmentSafe(ev model.Event, self int32, v procView, sshd *sshdIdentity)
 //     init namespace (ev.Creds.UID) is 0 or the host file's CURRENT owner
 //     (read at decision time; currentOwner < 0 means the file is absent, and
 //     then only root qualifies). Heal re-checks this under the verified
-//     directory fd right before restoring.
+//     directory fd before staging the restored copy (not atomic with the
+//     rename; see FORK.md).
 //     This is checked FIRST and on every branch. Without it, an unprivileged
 //     user in its own user+mount namespace can write a private copy at the
 //     same path (that is the event) and then remove it — rm, or umount of a

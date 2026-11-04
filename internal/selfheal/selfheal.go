@@ -142,7 +142,8 @@ type Result struct {
 // Heal saves the current (tampered) file to quarantine and atomically restores
 // the known-good content, with the original owner, group and mode. writerUID
 // is the (least-privileged) real uid of the writer(s) whose event triggered
-// the heal; under the verified directory fd, just before the restore, a
+// the heal; under the verified directory fd, before staging (not atomically
+// with the rename — the owner can race it in her own directory), a
 // non-root writer may only heal a file that exists and is owned by that
 // writer and the snapshot owner, and an absent file is recreated only for a
 // root writer (see mayRestore). A file whose content already matches the

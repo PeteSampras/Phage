@@ -57,10 +57,14 @@ both required:
    namespace (from the kernel event) is 0 or the host file's **current**
    owner, read at decision time through the verified directory. An absent file
    has no owner, so only a root writer qualifies. The gate checks this before
-   the inode comparison, and Heal re-checks it under the verified directory fd
-   just before restoring: a non-root writer may restore only a file that exists
-   and is owned by it (and by the snapshot owner). If several write-opens
-   arrive during one heal, the least-privileged writer counts. Without
+   the inode comparison. Heal re-checks it under the verified directory fd
+   before staging the restored copy: a non-root writer may restore only a file
+   that exists and is owned by it (and by the snapshot owner). This check is
+   not atomic with the rename. In her own directory the owner can still race
+   it (delete the file, or swap the staged copy), which only restores her own
+   file with her own snapshot content; the audit can then say `healed` even
+   though she swapped the staged copy. If several write-opens arrive during
+   one heal, the least-privileged writer counts. Without
    it, an unprivileged user in its own user+mount namespace can put a tmpfs
    over the directory, write a private copy (that is the event), then `rm` it
    or `umount` the tmpfs so its view resolves to the host inode again, and make
