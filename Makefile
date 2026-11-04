@@ -32,7 +32,7 @@ BPF_ARCH  := $(if $(filter x86_64,$(UNAME_M)),x86,$(if $(filter aarch64,$(UNAME_
 BPF_SRCS  := $(wildcard bpf/programs/*.bpf.c)
 BPF_OBJS  := $(patsubst bpf/programs/%.bpf.c,bpf/build/%.bpf.o,$(BPF_SRCS))
 
-.PHONY: all build daemon cli jail test lint tidy clean bpf gen-vmlinux install uninstall dist help
+.PHONY: all build daemon cli jail test lint tidy clean bpf gen-vmlinux install uninstall dist release help
 
 all: build ## Build everything (Go only)
 
@@ -104,6 +104,9 @@ dist: ## Package a release tarball + checksums from the built artifacts (run bui
 	tar czf $(DIST)/$(DISTNAME).tar.gz -C $(DIST) $(DISTNAME)
 	cd $(DIST) && $(SHASUM) $(DISTNAME).tar.gz > SHA256SUMS
 	@echo "packaged $(DIST)/$(DISTNAME).tar.gz ($(VERSION))"
+
+release: ## Pinned in-house release: go.mod's Go, CGO_ENABLED=0, -trimpath, -buildvcs, local vmlinux.h, SHA256SUMS (Linux)
+	./scripts/build/release.sh
 
 uninstall: ## Remove binaries, eBPF objects, and the unit (keeps /etc/phage and /var/lib/phage)
 	rm -f $(BINDIR)/phaged $(BINDIR)/phage $(BINDIR)/phage-jail
