@@ -3,8 +3,14 @@
 Security tools love to publish detection rates. Almost none publish their
 **false-positive rate** next to it, because that number is where behavioral tools
 get embarrassing. PhageBench measures both, on one reproducible harness
-([`scripts/bench/phagebench.sh`](../../scripts/bench/phagebench.sh)), and reports
+(upstream `scripts/bench/phagebench.sh`, not shipped in this fork), and reports
 whatever comes out — including the parts that need work.
+
+> **Fork note:** the reproduction harness this page cites lived under
+> `scripts/` and has been removed from this fork, with the other upstream
+> demo/bench scripts (they install setuid-root shells, `rm -rf` paths as root,
+> or rsync to the upstream author's lab host). The results below are
+> upstream's, kept for reference. See [FORK.md](../../FORK.md).
 
 ## What it measures
 1. **Detection rate** — of a labeled attack corpus, how many Phage flags, counting
@@ -91,4 +97,4 @@ The FP result makes the priorities concrete and measurable:
 3. **Enable-op cold start** — a host that never performs an enabling op has no
    baseline for it; decide whether such ops should default to suspicious.
 
-Re-run it yourself: `sudo ./scripts/bench/phagebench.sh`.
+(The upstream harness, `scripts/bench/phagebench.sh`, is not shipped in this fork.)

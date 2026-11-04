@@ -1,12 +1,18 @@
 # Demo: the graduated-response matrix (proportional, escalating, reversible)
 
+> **Fork note:** the reproduction harness this page cites lived under
+> `scripts/` and has been removed from this fork, with the other upstream
+> demo/bench scripts (they install setuid-root shells, `rm -rf` paths as root,
+> or rsync to the upstream author's lab host). The results below are
+> upstream's, kept for reference. See [FORK.md](../../FORK.md).
+
 Live runs on the test server (kernel 7.0, BPF LSM active) showing Phage's
 **brain**: the policy layer that, for every verdict, picks the *least-invasive
 sufficient* action, **escalates** a process that keeps earning evidence, and
 **de-escalates** — releases — a contained process that goes quiet. One knob,
 three behaviours, all reversible.
 
-Reproduce end to end with `scripts/bench/matrix-experiments.sh` (enforce mode,
+Upstream reproduced this end to end with `scripts/bench/matrix-experiments.sh` (enforce mode,
 honeytokens + self-heal on, a deliberately short 12s release lease). Every log
 line below is copied from a real run of that script.
 
@@ -118,4 +124,4 @@ document the results" is for:
   (`respond`, `releaseLoop`).
 - The scorer floor that makes the privesc verdict reachable:
   `internal/analysis/scorer/behavioral/anomaly.go` (`overrideFeatures`).
-- Harness: `scripts/bench/matrix-experiments.sh`.
+- Harness: upstream `scripts/bench/matrix-experiments.sh` (removed from this fork).

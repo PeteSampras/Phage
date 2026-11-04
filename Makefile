@@ -18,9 +18,9 @@ SYSCONFDIR  := $(DESTDIR)/etc/phage
 UNITDIR     := $(DESTDIR)/etc/systemd/system
 
 # Release packaging. The tarball carries the binaries, the CO-RE eBPF objects,
-# a default config, and the unit — everything the installer needs with no
-# toolchain on the target. Asset name is unversioned so /releases/latest/download
-# gives a stable URL; the version lives in a VERSION file inside.
+# a default config, and the unit. (This fork does not consume release tarballs:
+# it is built in-house from a pinned commit; see FORK.md.) The version lives in
+# a VERSION file inside.
 DIST      := dist
 DISTNAME  := phage_linux_amd64
 SHASUM    := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo 'shasum -a 256')

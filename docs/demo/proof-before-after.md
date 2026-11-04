@@ -4,7 +4,13 @@ This is a results document for anyone evaluating Phage. It shows four real attac
 run on a live test server **twice** — once with Phage off (the attack succeeds),
 once with Phage on (it is detected, contained, or blocked) — with the actual
 output each time. Everything here is reproducible from one script
-([`scripts/dev/proof.sh`](../../scripts/dev/proof.sh)).
+(upstream `scripts/dev/proof.sh`, not shipped in this fork).
+
+> **Fork note:** the reproduction harness this page cites lived under
+> `scripts/` and has been removed from this fork, with the other upstream
+> demo/bench scripts (they install setuid-root shells, `rm -rf` paths as root,
+> or rsync to the upstream author's lab host). The results below are
+> upstream's, kept for reference. See [FORK.md](../../FORK.md).
 
 - **Test host:** Ubuntu, kernel 7.0.0-30 x86_64, cgroup v2, BPF LSM active.
 - **No signatures.** Phage was given ~20 seconds to learn the host's normal
@@ -159,7 +165,7 @@ bash: /bin/bash: Operation not permitted
 ## Reproduce it yourself
 ```sh
 make bpf && make build            # build on the Linux host
-sudo ./scripts/dev/proof.sh       # runs all four, before and after, and cleans up
+# upstream: sudo ./scripts/dev/proof.sh — removed from this fork
 ```
 The script learns a baseline, then runs each attack with and without Phage,
 printing the evidence above. It restores the box on exit.

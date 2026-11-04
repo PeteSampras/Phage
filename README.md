@@ -9,7 +9,6 @@ living defense that works without knowing the pathogen in advance. This one does
 the same for your server.*
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/AzozzALFiras/Phage?sort=semver)](https://github.com/AzozzALFiras/Phage/releases/latest)
 [![Go](https://img.shields.io/github/go-mod/go-version/AzozzALFiras/Phage)](go.mod)
 [![Go Report Card](https://goreportcard.com/badge/github.com/AzozzALFiras/Phage)](https://goreportcard.com/report/github.com/AzozzALFiras/Phage)
 ![Platform: Linux eBPF](https://img.shields.io/badge/platform-Linux%20eBPF-blue)
@@ -210,32 +209,26 @@ why seccomp for jails) are recorded as ADRs under
 
 ## Install
 
-One command — it detects your platform, downloads a prebuilt release (static
-binaries + CO-RE eBPF objects, **no toolchain required**), verifies its checksum,
-installs it, and starts the service in **learn** mode (watches and learns, acts
-on nothing):
+**This fork is built in-house from a pinned commit; it never downloads release
+artifacts.** The upstream `curl | sudo bash` installer (which fetched
+`releases/latest` unpinned) has been removed — see [FORK.md](FORK.md). Build on
+a Linux host from a reviewed commit and install what you built:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AzozzALFiras/Phage/main/scripts/install.sh | sudo bash
+git clone https://github.com/PeteSampras/phage.git && cd phage
+git checkout <reviewed-commit-sha>   # pin: never build an unreviewed tip
+make gen-vmlinux bpf build            # needs Go, clang/llvm and libbpf headers
+sudo make install                     # starts nothing; see below
+sudo systemctl daemon-reload && sudo systemctl enable --now phage
 ```
 
-…or, the same thing from a clone:
-
-```sh
-git clone https://github.com/AzozzALFiras/Phage.git && cd Phage
-sudo ./scripts/install.sh
-```
-
-Prebuilt binaries are published for **linux/amd64**. On another architecture — or
-if you set `PHAGE_FROM_SOURCE=1` — the installer builds from source instead, which
-needs a Go + clang/libbpf toolchain on the target. It lays the pieces out like
-this:
+It lays the pieces out like this:
 
 | Path | What |
 |---|---|
 | `/usr/local/bin/{phaged,phage,phage-jail}` | the daemon, the operator CLI, the jail tool |
 | `/usr/local/lib/phage/*.bpf.o` | the compiled eBPF sensors |
-| `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`) |
+| `/etc/phage/phage.yaml` | configuration (ships as `mode: learn`, every enforcement feature off) |
 | `/etc/systemd/system/phage.service` | the systemd unit |
 | `/var/lib/phage/` | the learned baseline and the audit trail |
 

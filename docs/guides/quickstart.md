@@ -2,8 +2,7 @@
 
 > ⚠️ Early but working. The daemon loads the eBPF sensors, learns a baseline,
 > and scores/contains in alert and enforce modes, live-verified on a test server.
-> The installer uses a prebuilt linux/amd64 release when one is available and
-> otherwise builds from source. See [development](development.md).
+> This fork builds from source only. See [development](development.md).
 
 ## Requirements
 - Linux, kernel ≥ 5.8 with BTF (`CONFIG_DEBUG_INFO_BTF=y`). Check:
@@ -13,18 +12,15 @@
 - Root (eBPF loading needs privileges).
 
 ## Install
-One command — it downloads a prebuilt linux/amd64 release (static binaries +
-CO-RE eBPF objects, no toolchain needed), verifies its checksum, installs the
-daemon/CLI/eBPF-objects/config/systemd-unit, and starts the service in learn mode:
+This fork is built in-house from a pinned, reviewed commit — there is no
+release download or `curl | sudo bash` installer (see [FORK.md](../../FORK.md)).
+On the target (or a build host with the same architecture):
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AzozzALFiras/Phage/main/scripts/install.sh | sudo bash
+git checkout <reviewed-commit-sha>
+make gen-vmlinux bpf build && sudo make install
+sudo systemctl daemon-reload && sudo systemctl enable --now phage
 ```
-Or, from a clone, `sudo ./scripts/install.sh`. On a non-amd64 arch, or with
-`PHAGE_FROM_SOURCE=1`, it builds from source instead (needs Go + clang/libbpf).
-A short vanity URL (`https://get.phage.sh`) may come later; the raw URL above is
-the real one today.
-
-If you used the installer, Phage is **already running in learn mode** — skip to
+The service then runs in **learn mode** — skip to
 [Graduate to alert](#graduate-to-alert) once the baseline is mature, and use
 `journalctl -u phage -f` to watch it. The manual steps below are for running
 straight from a source tree instead.

@@ -51,7 +51,7 @@ explainable loop* is the new part).
 
 ### Tier 1 — The credibility knockout (weeks)
 - **PhageBench** — ✅ **v1 shipped** ([benchmark](benchmark/phagebench.md),
-  `scripts/bench/phagebench.sh`): learns a benign baseline, then reports detection
+  upstream `scripts/bench/phagebench.sh`, not shipped in this fork): learns a benign baseline, then reports detection
   rate (7/7 on the attack corpus) **and** false positives from a benign-only
   window, with an honest breakdown showing the FPs are unlearned benign *system*
   programs (the exec-novelty-vs-baseline-maturity tradeoff). Remaining: run the
