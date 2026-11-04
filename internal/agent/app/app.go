@@ -164,20 +164,35 @@ func (a *App) Run(ctx context.Context) error {
 	// could not arm, for the single ENFORCEMENT ARMED line + audit record below.
 	var armed, failed []string
 
-	// Honeytokens: plant decoy credential files and alert on any read.
+	// Honeytokens (deception.honeytokens; alert or enforce): plant decoy
+	// credential files and alert on any read. Decoys a previous run left behind
+	// (e.g. after a crash) are re-adopted from the record next to the baseline.
 	if a.cfg.Armed(config.FeatureHoneytokens) {
-		paths, inodes := honeytoken.Seed()
-		if len(inodes) == 0 {
-			log.Printf("honeytokens: none planted (decoy paths already exist?)")
-			failed = append(failed, config.FeatureHoneytokens)
-		} else if err := sensor.SetHoneytokens(inodes); err != nil {
+		ht := honeytoken.New(filepath.Join(filepath.Dir(a.cfg.StatePath), "honeytokens.json"), honeytoken.Decoys)
+		planted, err := ht.Seed()
+		switch {
+		case err != nil:
 			log.Printf("honeytokens: %v", err)
-			honeytoken.Remove(paths)
 			failed = append(failed, config.FeatureHoneytokens)
-		} else {
-			defer honeytoken.Remove(paths)
-			armed = append(armed, config.FeatureHoneytokens)
-			log.Printf("honeytokens planted: %d decoys — any read of one is a high-confidence alert", len(paths))
+		case len(planted) == 0:
+			log.Printf("honeytokens: none planted (real files at every decoy path)")
+			failed = append(failed, config.FeatureHoneytokens)
+		default:
+			if err := sensor.SetHoneytokens(honeytoken.Inodes(planted)); err != nil {
+				log.Printf("honeytokens: %v", err)
+				ht.Shutdown(planted)
+				failed = append(failed, config.FeatureHoneytokens)
+			} else {
+				defer ht.Shutdown(planted)
+				armed = append(armed, config.FeatureHoneytokens)
+				adopted := 0
+				for _, p := range planted {
+					if p.Adopted {
+						adopted++
+					}
+				}
+				log.Printf("honeytokens planted: %d decoys (%d re-adopted from a previous run) — any read of one is a high-confidence alert", len(planted), adopted)
+			}
 		}
 	}
 
