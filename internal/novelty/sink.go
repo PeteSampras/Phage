@@ -52,6 +52,9 @@ func (s *Sink) open() error {
 // Write appends one row. Each row is written with a single write(2) on an
 // O_APPEND descriptor, so a row is never interleaved with another.
 func (s *Sink) Write(r Row) error {
+	if !writableTLP(r.TLP) {
+		return fmt.Errorf("novelty row %s: TLP %q is not one this sink writes (clear, green, amber, amber+strict)", r.UID, r.TLP)
+	}
 	b, err := json.Marshal(r)
 	if err != nil {
 		return err
@@ -114,8 +117,10 @@ func (s *Sink) Close() error {
 
 // Counters are an Emitter's counts since it was created.
 type Counters struct {
-	Rows       uint64 // rows written
-	Suppressed uint64 // repeats of a uid already written in its bucket
+	Rows       uint64 // rows written (burst rows included)
+	Suppressed uint64 // repeats of a uid still remembered (the same finding again)
+	OverCap    uint64 // new rows past a profile's per-bucket cap (a burst row stands for them)
+	Bursts     uint64 // burst rows emitted
 	Errors     uint64 // rows that could not be written
 }
 
@@ -124,39 +129,63 @@ type writer interface {
 	Write(Row) error
 }
 
-// Emitter writes rows once per uid, counts what it did, and reports write
-// failures loudly but without flooding the log: the first failure at once,
-// then at most one line per errorEvery, each carrying the number of failures
-// since the last line. A write failure never stops the daemon.
+// Emitter writes rows once per uid, bounds how many new rows one profile may
+// write per uid bucket, counts what it did, and reports write failures loudly
+// but without flooding the log: the first failure at once, then at most one
+// line per errorEvery, each carrying the number of failures since the last
+// line. A write failure never stops the daemon.
 type Emitter struct {
-	w    writer
-	logf func(format string, args ...any)
-	now  func() time.Time
+	w      writer
+	id     Identity
+	maxPer int // new rows per (profile, entity, bucket) before a burst row
+	logf   func(format string, args ...any)
+	now    func() time.Time
 
 	mu         sync.Mutex
-	seen       map[string]time.Time // uid -> when written, for the current dedupe window
+	seen       map[string]time.Time // uid -> when first emitted
+	perBucket  map[bucketKey]int    // new rows per profile and bucket
+	lastSweep  time.Time
+	sweeps     uint64 // for tests: full scans of seen
 	window     time.Duration
 	c          Counters
 	lastErrLog time.Time
 	errsSince  uint64
 }
 
+type bucketKey struct {
+	profile, entity string
+	bucket          int64
+}
+
 // maxSeen bounds the dedupe set. Past it, rows are written without dedupe
-// (never dropped): a flood of distinct findings is itself worth seeing.
+// (never dropped); the per-bucket cap still bounds them.
 const maxSeen = 65536
+
+// sweepEvery is the most often the dedupe set is scanned for expired uids:
+// a scan of a full set is O(maxSeen), far too slow for every event.
+const sweepEvery = time.Minute
 
 // errorEvery is the minimum gap between two write-failure log lines.
 const errorEvery = time.Minute
 
-// NewEmitter returns an Emitter writing to w. window is how long a uid is
-// remembered (the uid bucket). logf receives failure lines. A nil w writes
-// nothing and only dedupes, so a caller can still log each new finding once.
-func NewEmitter(w writer, window time.Duration, logf func(string, ...any)) *Emitter {
-	return &Emitter{w: w, logf: logf, now: time.Now, seen: map[string]time.Time{}, window: window}
+// NewEmitter returns an Emitter writing to w. id names the source and entity
+// of the burst rows it writes and its Bucket is how long a uid is
+// remembered; maxPerBucket caps the new rows per profile per bucket (0: no
+// cap). logf receives failure lines. A nil w writes nothing and only dedupes
+// and caps, so a caller can still log each new finding once.
+func NewEmitter(w writer, id Identity, maxPerBucket int, logf func(string, ...any)) *Emitter {
+	window := id.Bucket
+	if window <= 0 {
+		window = time.Hour
+	}
+	return &Emitter{w: w, id: id, maxPer: maxPerBucket, logf: logf, now: time.Now,
+		seen: map[string]time.Time{}, perBucket: map[bucketKey]int{}, window: window}
 }
 
-// Emit writes r unless its uid was already written within the window. It
-// reports whether the row was new (written or attempted).
+// Emit writes r unless its uid is still remembered or its profile is past
+// the per-bucket cap. The first row past the cap is replaced by one `burst`
+// row carrying the count so far; later ones are only counted. It reports
+// whether r itself was new and within the cap (written or attempted).
 func (e *Emitter) Emit(r Row) bool {
 	if e == nil {
 		return false
@@ -168,28 +197,39 @@ func (e *Emitter) Emit(r Row) bool {
 		e.mu.Unlock()
 		return false
 	}
-	if len(e.seen) >= maxSeen {
-		for uid, t := range e.seen {
-			if now.Sub(t) >= 2*e.window {
-				delete(e.seen, uid)
-			}
-		}
+	if now.Sub(e.lastSweep) >= sweepEvery {
+		e.sweep(now)
 	}
 	if len(e.seen) < maxSeen {
 		e.seen[r.UID] = now
 	}
+	out := r
+	if e.maxPer > 0 {
+		k := bucketKey{r.Profile, r.Entity, r.bucket.Unix()}
+		e.perBucket[k]++
+		switch n := e.perBucket[k]; {
+		case n == e.maxPer+1:
+			out = e.id.Burst(r, n, now)
+			e.c.OverCap++
+			e.c.Bursts++
+		case n > e.maxPer+1:
+			e.c.OverCap++
+			e.mu.Unlock()
+			return false
+		}
+	}
 	e.mu.Unlock()
 	if e.w == nil {
-		return true // no sink: dedupe only (it still rate-limits the log line)
+		return out.Status != StatusBurst
 	}
 
-	err := e.w.Write(r)
+	err := e.w.Write(out)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err == nil {
 		e.c.Rows++
-		return true
+		return out.Status != StatusBurst
 	}
 	e.c.Errors++
 	e.errsSince++
@@ -198,7 +238,25 @@ func (e *Emitter) Emit(r Row) bool {
 		e.logf("NOVELTY SINK WRITE FAILED (%d failure(s) since the last report; rows are being lost): %v", e.errsSince, err)
 		e.lastErrLog, e.errsSince = now, 0
 	}
-	return true
+	return out.Status != StatusBurst
+}
+
+// sweep drops expired uids and finished buckets. Called with e.mu held, at
+// most once per sweepEvery.
+func (e *Emitter) sweep(now time.Time) {
+	e.lastSweep = now
+	e.sweeps++
+	for uid, t := range e.seen {
+		if now.Sub(t) >= 2*e.window {
+			delete(e.seen, uid)
+		}
+	}
+	oldest := now.Add(-2 * e.window).Unix()
+	for k := range e.perBucket {
+		if k.bucket < oldest {
+			delete(e.perBucket, k)
+		}
+	}
 }
 
 // Counters returns the counts so far.

@@ -66,7 +66,6 @@ type App struct {
 	novelty   *novelty.Emitter
 	sink      *novelty.Sink
 	ident     novelty.Identity
-	hostname  func() (string, error)
 	overflown map[string]bool // feature keys whose cap overflow was logged (event loop only)
 
 	// Sensor health, for the heartbeat and phage status. drops reads the
@@ -106,7 +105,12 @@ type App struct {
 	recent      []control.Alert
 	recentLimit int
 	lag         lagStats // enrichment lag since the last heartbeat
-	ckptErrors  uint64   // failed baseline checkpoints
+	// cached baseline state (see baselineState)
+	state        string
+	stateGen     uint64
+	stateSamples uint64
+	stateKnown   bool
+	ckptErrors   uint64 // failed baseline checkpoints
 
 	// graduated-response state: which processes are contained, at what rung, and
 	// when they last drew a high verdict (for escalation and auto-release).
@@ -164,7 +168,6 @@ func New(cfg config.Config, objPath string, store profile.Repository, meta Meta)
 		healGate:    writerSeesHostFile,
 		healDelay:   func() { time.Sleep(250 * time.Millisecond) },
 		sshd:        newSSHDIdentity(),
-		hostname:    os.Hostname,
 		monoNow:     monotonicNow,
 		overflown:   map[string]bool{},
 	}
@@ -181,6 +184,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.savedGen = a.profile.Generation()
 	log.Printf("baseline %s sha256=%s (%d value(s) refused at the per-feature cap so far)",
 		a.cfg.StatePath, a.store.Digest(), a.profile.Overflow())
+	a.announceBaseline()
 
 	aw, err := audit.Open(a.cfg.AuditPath)
 	if err != nil {
@@ -687,14 +691,14 @@ func (a *App) announceStartup(armed, failed []string) error {
 		PID: a.selfPID, Comm: "phaged", Mode: a.cfg.Mode.String(), Version: a.meta.Version,
 		ConfigPath: src.Path, ConfigSHA256: src.SHA256, BaselineSHA256: a.baselineSHA(),
 	}
-	if a.novelty != nil {
-		base.NoveltyPath, base.NoveltyEntity, base.TLP = a.cfg.Output.NoveltyPath, a.ident.EntityKind+":"+a.ident.Entity, a.ident.TLP
-		if a.sink == nil {
-			base.NoveltyPath = ""
-		}
+	if a.profile != nil {
+		base.BaselineState, _ = a.baselineState()
 	}
-	prov := fmt.Sprintf("config_path=%q config_sha256=%s baseline_sha256=%s version=%q pid=%d",
-		src.Path, orNone(src.SHA256), a.baselineSHA(), a.meta.Version, a.selfPID)
+	if a.sink != nil {
+		base.NoveltyPath, base.NoveltyEntity, base.TLP = a.cfg.Output.NoveltyPath, a.ident.EntityKind+":"+a.ident.Entity, a.ident.TLP
+	}
+	prov := fmt.Sprintf("config_path=%q config_sha256=%s baseline_sha256=%s baseline_state=%s version=%q pid=%d",
+		src.Path, orNone(src.SHA256), a.baselineSHA(), orNone(base.BaselineState), a.meta.Version, a.selfPID)
 
 	var records []audit.Entry
 	if len(a.meta.Disarmed) > 0 {
@@ -774,14 +778,18 @@ func (a *App) gate(want action.Type) (action.Type, string) {
 // Status implements control.Handler.
 func (a *App) Status() control.Status {
 	// The drop counter is read live (outside a.mu: it is a map lookup).
-	var drops uint64
+	var drops *uint64
 	var dropsErr string
 	if a.drops == nil {
 		dropsErr = "sensor not loaded"
 	} else if n, err := a.drops(); err != nil {
 		dropsErr = err.Error()
 	} else {
-		drops = n
+		drops = &n
+	}
+	var state string
+	if a.profile != nil {
+		state, _ = a.baselineState()
 	}
 	c := a.novelty.Counters()
 	var overflow uint64
@@ -800,6 +808,7 @@ func (a *App) Status() control.Status {
 		Drops:          drops,
 		DropsError:     dropsErr,
 		BaselineSHA256: a.baselineSHA(),
+		BaselineState:  state,
 		Overflow:       overflow,
 		NoveltyRows:    c.Rows,
 		NoveltyErrors:  c.Errors,

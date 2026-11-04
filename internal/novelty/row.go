@@ -24,12 +24,24 @@ import (
 	"github.com/AzozzALFiras/Phage/internal/event/model"
 )
 
-// Row statuses Phage writes. The lake analyzer's burst and high_cardinality
-// statuses have no Phage counterpart.
+// Row statuses Phage writes. The lake analyzer's high_cardinality status has
+// no Phage counterpart.
 const (
 	StatusFinding   = "finding"   // scored at or above the notify threshold
 	StatusUnlearned = "unlearned" // the event's feature class has no learned baseline: no score
+	StatusBurst     = "burst"     // more new rows for one profile in one bucket than the cap: no score, a signal
 )
+
+// writableTLP reports whether a row's label is one Phage may write: a
+// canonical TLP 2.0 label other than red (a red row can never be written to
+// the lake). Config validation refuses the rest; the sink checks again.
+func writableTLP(l string) bool {
+	switch l {
+	case "clear", "green", "amber", "amber+strict":
+		return true
+	}
+	return false
+}
 
 // SourceKind is the only kind a novelty row may have.
 const SourceKind = "heuristic"
@@ -65,6 +77,8 @@ type Row struct {
 	Message     string   `json:"message"`
 	Reasons     []string `json:"reasons"`
 	TLP         string   `json:"tlp"`
+
+	bucket time.Time // start of the uid bucket (not a column)
 }
 
 // Identity is what names this sensor and its host in every row.
@@ -200,7 +214,29 @@ func (id Identity) base(ev model.Event, status string, asOf time.Time) Row {
 		Count:      1,
 		TLP:        id.TLP,
 	}
-	r.UID = id.uid(r, t)
+	r.bucket = id.bucketOf(t)
+	r.UID = id.uid(r)
+	return r
+}
+
+// Burst builds the row that stands for every new row of trigger's profile
+// past the per-bucket cap: no value, no score, the count of new rows seen in
+// the bucket when the cap was passed (later ones are counted in the
+// heartbeat's novelty_over_cap, not here). Its time is the triggering
+// event's; its uid is one per profile, entity and bucket.
+func (id Identity) Burst(trigger Row, count int, asOf time.Time) Row {
+	r := trigger
+	r.Value, r.Status = "", StatusBurst
+	r.Score, r.Confidence, r.Support, r.EntityTotal = nil, nil, nil, nil
+	r.Count = int64(count)
+	r.AsOf = Timestamp(asOf)
+	r.UID = id.uid(r)
+	r.Reasons = clipAll([]string{
+		fmt.Sprintf("%d new %s rows in the bucket starting %s > novelty_max_per_bucket %d: the rest are counted, not written",
+			count, r.Profile, Timestamp(r.bucket), count-1),
+	}, maxReason)
+	r.Message = clip(fmt.Sprintf("%s: %d new %s rows in one bucket (a burst, such as a scan or a flood); look the values up in the audit trail (burst)",
+		r.Entity, count, r.Profile), maxMessage)
 	return r
 }
 
@@ -208,18 +244,22 @@ func (id Identity) base(ev model.Event, status string, asOf time.Time) Row {
 // and the start of the event's time bucket: the same finding within one
 // bucket has one uid, so the lake's (source, uid) key keeps it once however
 // often the event repeats, and a later bucket is a new row.
-func (id Identity) uid(r Row, t time.Time) string {
-	bucket := id.Bucket
-	if bucket <= 0 {
-		bucket = time.Hour
-	}
+func (id Identity) uid(r Row) string {
 	h := sha256.New()
 	for _, f := range []string{r.Source, r.Profile, r.Status, r.EntityKind, r.Entity, r.Value,
-		strconv.FormatInt(t.UTC().Truncate(bucket).Unix(), 10)} {
+		strconv.FormatInt(r.bucket.Unix(), 10)} {
 		h.Write([]byte(f))
 		h.Write([]byte{0})
 	}
 	return "phage-" + hex.EncodeToString(h.Sum(nil))[:40]
+}
+
+func (id Identity) bucketOf(t time.Time) time.Time {
+	b := id.Bucket
+	if b <= 0 {
+		b = time.Hour
+	}
+	return t.UTC().Truncate(b)
 }
 
 // Timestamp formats a time as the lake stores it: RFC 3339, UTC, with

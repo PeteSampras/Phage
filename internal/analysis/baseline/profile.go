@@ -84,6 +84,28 @@ func (p *Profile) Overflow() uint64 {
 	return n
 }
 
+// Observations is the total number of feature observations learned, over
+// every feature (each learned event adds one per feature it carries).
+func (p *Profile) Observations() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var n uint64
+	for _, t := range p.totals {
+		n += t
+	}
+	return n
+}
+
+// AtCap reports whether key can learn no new value: it holds the maximum
+// number of distinct values, or refused values before (an imported baseline
+// that overflowed). A value not learned for such a key is novel because of
+// the cap, not necessarily because the host never produced it.
+func (p *Profile) AtCap(key string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.overflow[key] > 0 || (p.max > 0 && len(p.counts[key]) >= p.max)
+}
+
 // Generation changes whenever the learned state changes.
 func (p *Profile) Generation() uint64 {
 	p.mu.RLock()

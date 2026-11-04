@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/AzozzALFiras/Phage/internal/analysis/baseline"
 	"github.com/AzozzALFiras/Phage/internal/control"
@@ -72,9 +74,10 @@ func TestBaselineRefusals(t *testing.T) {
 }
 
 func TestFormatHealth(t *testing.T) {
-	out := formatHealth(control.Status{Drops: 3, EventsPerSec: 12.5, LastHeartbeat: "2026-11-04T10:00:00Z",
+	three := uint64(3)
+	out := formatHealth(control.Status{Drops: &three, BaselineState: "warming", EventsPerSec: 12.5, LastHeartbeat: "2026-11-04T10:00:00Z",
 		BaselineSHA256: "abc", NoveltyPath: "/var/lib/phage/novelty.jsonl", NoveltyRows: 2})
-	for _, want := range []string{"drops=3", "events_per_sec=12.50", "baseline_sha256=abc", "novelty=/var/lib/phage/novelty.jsonl rows=2"} {
+	for _, want := range []string{"drops=3", "baseline_state=warming", "events_per_sec=12.50", "baseline_sha256=abc", "novelty=/var/lib/phage/novelty.jsonl rows=2"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in %q", want, out)
 		}
@@ -82,5 +85,34 @@ func TestFormatHealth(t *testing.T) {
 	out = formatHealth(control.Status{DropsError: "no map\nFORGED"})
 	if !strings.Contains(out, "drops=unknown") || strings.Contains(out, "\nFORGED") || !strings.Contains(out, "last_heartbeat=none yet") {
 		t.Errorf("error rendering: %q", out)
+	}
+}
+
+func TestBaselineRefusesFIFOAndCleansOutput(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skip(err)
+	}
+	done := make(chan int, 1)
+	go func() { code, _, _ := run("show", fifo); done <- code }()
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Errorf("FIFO: exit %d, want 1", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("show blocked on a FIFO")
+	}
+	// A key or value carrying control bytes is printed escaped.
+	p := filepath.Join(dir, "evil.json")
+	os.WriteFile(p, []byte(`{"counts":{"k\u001b[31m\nFORGED":{"1\n2":1}},"totals":{"k\u001b[31m\nFORGED":1}}`), 0o600)
+	q := filepath.Join(dir, "empty.json")
+	os.WriteFile(q, []byte(`{"counts":{},"totals":{}}`), 0o600)
+	for _, args := range [][]string{{"show", p}, {"diff", q, p}} {
+		_, out, _ := run(args...)
+		if strings.Contains(out, "\x1b") || strings.Contains(out, "\nFORGED") || !strings.Contains(out, `\nFORGED`) {
+			t.Errorf("%v: output not escaped:\n%s", args, out)
+		}
 	}
 }

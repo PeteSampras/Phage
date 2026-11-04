@@ -156,3 +156,25 @@ func TestSummaryAndParse(t *testing.T) {
 		t.Error("a corrupt baseline must not parse")
 	}
 }
+
+func TestObservationsAndAtCap(t *testing.T) {
+	p := NewProfile()
+	if p.Observations() != 0 || p.AtCap("k") {
+		t.Fatal("empty profile")
+	}
+	p.SetMaxValuesPerKey(2)
+	p.Observe("k", 1)
+	p.Observe("j", 1)
+	if p.Observations() != 2 || p.AtCap("k") {
+		t.Fatal("below the cap")
+	}
+	p.Observe("k", 2)
+	if !p.AtCap("k") || p.AtCap("j") {
+		t.Error("k holds the maximum")
+	}
+	q := NewProfile() // no cap set, but the imported baseline overflowed before
+	q.Import(Snapshot{Counts: map[string]map[string]uint64{"k": {"1": 1}}, Totals: map[string]uint64{"k": 2}, Overflow: map[string]uint64{"k": 1}})
+	if !q.AtCap("k") {
+		t.Error("a key that overflowed is at its cap")
+	}
+}

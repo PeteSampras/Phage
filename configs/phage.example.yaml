@@ -51,39 +51,47 @@ deception:
   honeytokens: false   # plant decoy credential files; a read of one is a high-confidence alert
 
 # Learning. The baseline is checkpointed while learning (atomic temp file +
-# rename), so a crash loses at most one interval; a clean stop also saves it.
-# Each feature learns at most max_values_per_key distinct values: a new value
-# past the cap is counted (heartbeat baseline_overflow, `phage baseline show`),
-# logged once per feature, not learned, and so stays novel.
+# rename + directory fsync), so a crash loses at most one interval; a clean
+# stop also saves it. Each feature learns at most max_values_per_key distinct
+# values: a new value past the cap still counts as an observation, is counted
+# as overflow (heartbeat baseline_overflow, `phage baseline show`), is logged
+# once per feature, is not learned and stays novel (scored with discounted
+# confidence, reason "feature at cap; value not learned"). A baseline that
+# already holds more values keeps them. Until the baseline holds
+# min_baseline_samples feature observations it is `warming` (`no_baseline`
+# when empty): alert/enforce still score, but never-seen feature classes are
+# not reported as unlearned (startup, heartbeat and `phage status` say so).
 learn:
   checkpoint_interval: 10m
   max_values_per_key: 10000
+  min_baseline_samples: 5000
 
 # Reporting. Nothing here acts on the host: phaged only writes its own files.
 output:
-  # One JSON line per verdict at or above thresholds.notify, and one
+  # OPT-IN. One JSON line per verdict at or above thresholds.notify, and one
   # `unlearned` line when an event's whole feature class was never seen while
-  # learning, in homelab-next's novelty_finding shape (source_kind heuristic,
-  # advisory). Written in alert and enforce mode only. Empty disables it.
-  # Opened like the audit trail (0600, never through a symlink); phaged
-  # refuses to start if it is set and cannot be opened.
-  novelty_path: /var/lib/phage/novelty.jsonl
+  # learning (once the baseline is ready), in homelab-next's novelty_finding
+  # shape (source_kind heuristic: advisory). Alert and enforce mode only.
+  # Opened like the audit trail (0600, never through a symlink, owned by
+  # phaged, one link); phaged refuses to start if it is set and cannot be
+  # opened. When set, tlp, entity_kind and entity are REQUIRED.
+  # novelty_path: /var/lib/phage/novelty.jsonl
+  # tlp: amber          # clear | green | amber | amber+strict, exactly. red is
+  #                     # refused: a red row can never be written to the lake.
+  # entity_kind: ip     # ip | host | user | domain | process | other
+  # entity: 192.0.2.10  # the text your lake profiles use for this host (an ip
+  #                     # in canonical form, a host name in lower case)
   # Rotate to novelty.jsonl.1 at this size; 0 = never (use logrotate copytruncate).
   novelty_max_bytes: 67108864
   # A row's uid digests source, profile, status, entity and value with the
-  # event's time bucket: a repeat within one bucket is written once.
+  # event's time bucket: phaged writes a uid once while it remembers it (the
+  # bucket and the next), and the lake keeps it once.
   novelty_bucket: 1h
+  # At most this many new rows per profile per bucket; past it one `burst`
+  # row stands for the rest (a scan, a flood).
+  novelty_max_per_bucket: 20
   source: phage-host        # the row's `source` (never lake-novelty)
-  entity_kind: host         # ip | host | user | domain | process | other
-  # entity: web01           # default for kind host: this host's name; set it
-  #                         # to the name (or, with entity_kind: ip, the
-  #                         # canonical address) your lake profiles use
-  # TLP 2.0 label on every row: clear | green | amber | amber+strict | red,
-  # exactly. The default is red, which never over-shares but is invisible to
-  # a lake reader below red (homelab-next's corroborate reads below red), so
-  # set the label you mean.
-  tlp: red
   # Seconds between `heartbeat` audit records (events/s, ring-buffer drops,
-  # enrichment lag, mode, armed features, baseline sha256), in every mode.
-  # A SIEM alerts when they stop (deploy/wazuh/, docs/wazuh.md).
+  # enrichment lag, baseline state, mode, armed features, baseline sha256),
+  # in every mode. A SIEM alerts when they stop (deploy/wazuh/, docs/wazuh.md).
   heartbeat_interval: 60

@@ -7,7 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/AzozzALFiras/Phage/internal/agent/config"
 	"github.com/AzozzALFiras/Phage/internal/analysis/feature"
 	"github.com/AzozzALFiras/Phage/internal/audit"
 	"github.com/AzozzALFiras/Phage/internal/event/model"
@@ -20,44 +19,74 @@ import (
 // baseline checkpoint. None of it acts on the host.
 
 // openNovelty prepares the novelty output for alert and enforce mode: the
-// row identity, the dedupe emitter, and (unless output.novelty_path is empty)
-// the sink file. Learn mode scores nothing, so it opens nothing.
+// row identity, the emitter (dedupe and per-bucket cap) and, when
+// output.novelty_path is set (opt-in), the sink file. Learn mode scores
+// nothing, so it opens nothing. Config validation has already required
+// output.tlp, output.entity_kind and output.entity for a sink.
 func (a *App) openNovelty() error {
 	if a.cfg.Mode == mode.Learn {
 		return nil
 	}
 	o := a.cfg.Output
-	entity := o.Entity
-	if entity == "" { // kind host (config validation requires an entity otherwise)
-		h, err := a.hostname()
-		if err != nil {
-			return fmt.Errorf("output.entity: read the host name: %w (set output.entity)", err)
-		}
-		if err := config.ValidateEntity(o.EntityKind, h, false); err != nil {
-			return fmt.Errorf("output.entity: the host name %q cannot name this host: %w", h, err)
-		}
-		entity = h
+	a.ident = novelty.Identity{Source: o.Source, EntityKind: o.EntityKind, Entity: o.Entity, TLP: o.TLP, Bucket: o.NoveltyBucket}
+	if o.NoveltyPath == "" {
+		log.Printf("novelty sink off (output.novelty_path unset): findings are logged and audited only")
+		// An untyped nil, not a nil *Sink: the emitter then only dedupes and caps.
+		a.novelty = novelty.NewEmitter(nil, a.ident, o.NoveltyMaxPerBucket, log.Printf)
+		return nil
 	}
-	a.ident = novelty.Identity{Source: o.Source, EntityKind: o.EntityKind, Entity: entity, TLP: o.TLP, Bucket: o.NoveltyBucket}
-	var w *novelty.Sink
-	if o.NoveltyPath != "" {
-		s, err := novelty.OpenSink(o.NoveltyPath, o.NoveltyMaxBytes)
-		if err != nil {
-			return err
-		}
-		w, a.sink = s, s
-		log.Printf("novelty sink %s: source=%s entity=%s:%s tlp=%s (rows are advisory: source_kind heuristic)",
-			o.NoveltyPath, o.Source, o.EntityKind, entity, o.TLP)
-	} else {
-		log.Printf("novelty sink disabled (output.novelty_path empty): findings are logged and audited only")
+	s, err := novelty.OpenSink(o.NoveltyPath, o.NoveltyMaxBytes)
+	if err != nil {
+		return err
 	}
-	if w != nil {
-		a.novelty = novelty.NewEmitter(w, o.NoveltyBucket, log.Printf)
-	} else {
-		// An untyped nil, not a nil *Sink: the emitter then only dedupes.
-		a.novelty = novelty.NewEmitter(nil, o.NoveltyBucket, log.Printf)
-	}
+	a.sink = s
+	a.novelty = novelty.NewEmitter(s, a.ident, o.NoveltyMaxPerBucket, log.Printf)
+	log.Printf("novelty sink %s: source=%s entity=%s:%s tlp=%s, at most %d new rows per profile per %s (rows are advisory: source_kind heuristic)",
+		o.NoveltyPath, o.Source, o.EntityKind, o.Entity, o.TLP, o.NoveltyMaxPerBucket, o.NoveltyBucket)
 	return nil
+}
+
+// Baseline states, as the startup and heartbeat records and phage status
+// report them.
+const (
+	baselineNone    = "no_baseline" // no observation at all
+	baselineWarming = "warming"     // fewer than learn.min_baseline_samples observations
+	baselineReady   = "ready"
+)
+
+// baselineState classifies the baseline by its total feature observations.
+// The result is cached per profile generation (the baseline does not change
+// outside learn mode).
+func (a *App) baselineState() (string, uint64) {
+	gen := a.profile.Generation()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.stateKnown || gen != a.stateGen {
+		n := a.profile.Observations()
+		switch {
+		case n == 0:
+			a.state = baselineNone
+		case n < a.cfg.Learn.MinBaselineSamples:
+			a.state = baselineWarming
+		default:
+			a.state = baselineReady
+		}
+		a.stateKnown, a.stateGen, a.stateSamples = true, gen, n
+	}
+	return a.state, a.stateSamples
+}
+
+// announceBaseline logs the baseline state at startup, loudly when it is not
+// ready outside learn mode.
+func (a *App) announceBaseline() {
+	state, n := a.baselineState()
+	if state == baselineReady || a.cfg.Mode == mode.Learn {
+		log.Printf("baseline state=%s (%d feature observations; ready at %d)", state, n, a.cfg.Learn.MinBaselineSamples)
+		return
+	}
+	log.Printf("BASELINE NOT READY state=%s: %d feature observations, below learn.min_baseline_samples=%d, in %s mode — "+
+		"scores off a thin baseline are discounted and never-seen feature classes are NOT reported as unlearned; run learn mode longer",
+		state, n, a.cfg.Learn.MinBaselineSamples, a.cfg.Mode)
 }
 
 // baselineSHA names the baseline in use: the sha256 of the file as loaded or
@@ -77,6 +106,11 @@ func (a *App) baselineSHA() string {
 // is scored as before.
 func (a *App) unlearnedKeys(vec feature.Vector) []string {
 	if len(vec) == 0 {
+		return nil
+	}
+	// With no (or too thin a) baseline everything is unlearned, and a row per
+	// event would flood the sink and make this host corroborate everything.
+	if state, _ := a.baselineState(); state != baselineReady {
 		return nil
 	}
 	keys := make([]string, 0, len(vec))
@@ -188,7 +222,10 @@ func (a *App) heartbeat(now time.Time) audit.Entry {
 	ckptErrors := a.ckptErrors
 	a.mu.Unlock()
 
+	state, samples := a.baselineState()
 	h := audit.Health{
+		BaselineState:    state,
+		BaselineSamples:  samples,
 		IntervalSeconds:  round2(elapsed),
 		Events:           events,
 		EventsPerSec:     round2(float64(events) / elapsed),
@@ -215,6 +252,7 @@ func (a *App) heartbeat(now time.Time) audit.Entry {
 	c := a.novelty.Counters()
 	h.NoveltyRows = c.Rows - a.hb.novelty.Rows
 	h.NoveltySuppressed = c.Suppressed - a.hb.novelty.Suppressed
+	h.NoveltyOverCap = c.OverCap - a.hb.novelty.OverCap
 	h.NoveltyErrors = c.Errors - a.hb.novelty.Errors
 	a.hb.novelty = c
 
@@ -229,7 +267,7 @@ func (a *App) heartbeat(now time.Time) audit.Entry {
 	e := audit.Entry{
 		Time: now, Kind: audit.KindHeartbeat, Action: audit.KindHeartbeat,
 		PID: a.selfPID, Comm: "phaged", Mode: a.cfg.Mode.String(), Version: a.meta.Version,
-		Features: a.armed, BaselineSHA256: a.baselineSHA(), Health: &h,
+		Features: a.armed, BaselineSHA256: a.baselineSHA(), BaselineState: state, Health: &h,
 		Reason: fmt.Sprintf("heartbeat: %.2f events/s, %d drop(s), enrichment lag avg %.2fms max %.2fms",
 			h.EventsPerSec, h.Drops, h.EnrichLagMsAvg, h.EnrichLagMsMax),
 	}

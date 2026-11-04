@@ -6,6 +6,8 @@ import (
 	"io"
 	"sort"
 	"strconv"
+
+	"github.com/AzozzALFiras/Phage/internal/logsafe"
 )
 
 // Established reports whether a value seen n times is normal for its feature
@@ -143,7 +145,7 @@ func sortValues(l []string) {
 func WriteSummary(w io.Writer, s Snapshot) {
 	fmt.Fprintf(w, "%-28s %12s %9s %12s %9s\n", "feature", "observations", "distinct", "established", "overflow")
 	for _, ks := range Summarize(s) {
-		fmt.Fprintf(w, "%-28s %12d %9d %12d %9d\n", ks.Key, ks.Total, ks.Distinct, ks.Established, ks.Overflow)
+		fmt.Fprintf(w, "%-28s %12d %9d %12d %9d\n", logsafe.Clean(ks.Key), ks.Total, ks.Distinct, ks.Established, ks.Overflow)
 	}
 }
 
@@ -154,7 +156,7 @@ func WriteDiff(w io.Writer, diffs []KeyDiff, maxValues int) {
 		return
 	}
 	for _, d := range diffs {
-		fmt.Fprintf(w, "%s\n", d.Key)
+		fmt.Fprintf(w, "%s\n", logsafe.Clean(d.Key))
 		fmt.Fprintf(w, "  observations %d -> %d, distinct %d -> %d, established %d -> %d, overflow %d -> %d\n",
 			d.Old.Total, d.New.Total, d.Old.Distinct, d.New.Distinct, d.Old.Established, d.New.Established,
 			d.Old.Overflow, d.New.Overflow)
@@ -174,7 +176,11 @@ func WriteDiff(w io.Writer, diffs []KeyDiff, maxValues int) {
 			if maxValues > 0 && len(shown) > maxValues {
 				shown = shown[:maxValues]
 			}
-			fmt.Fprintf(w, "  %s (%d): %v", l.name, len(l.vals), shown)
+			clean := make([]string, len(shown))
+			for i, v := range shown {
+				clean[i] = logsafe.Clean(v)
+			}
+			fmt.Fprintf(w, "  %s (%d): %v", l.name, len(l.vals), clean)
 			if len(shown) < len(l.vals) {
 				fmt.Fprintf(w, " ... and %d more", len(l.vals)-len(shown))
 			}

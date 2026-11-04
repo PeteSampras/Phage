@@ -59,9 +59,13 @@ func outputApp(t *testing.T, m mode.Mode) (*App, string, string) {
 	c.AuditPath = filepath.Join(dir, "audit.jsonl")
 	c.Output.NoveltyPath = filepath.Join(dir, "novelty.jsonl")
 	c.Output.TLP = "amber"
+	c.Output.EntityKind, c.Output.Entity = "host", "web01"
+	c.Learn.MinBaselineSamples = 1 // these tests learn a little; the empty-baseline test uses the default
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
 	a := New(c, "", &fakeStore{}, Meta{Version: "v-test"})
 	a.selfPID = selfPID
-	a.hostname = func() (string, error) { return "web01", nil }
 	a.monoNow = nil
 	aw, err := audit.Open(c.AuditPath)
 	if err != nil {
@@ -200,34 +204,86 @@ func TestLearnModeWritesNoRowsAndLogsCapOnce(t *testing.T) {
 }
 
 func TestOpenNovelty(t *testing.T) {
-	c := config.Default()
+	c := config.Default() // the sink is opt-in: no path
 	c.Mode = mode.Alert
-	c.Output.NoveltyPath = ""
 	a := New(c, "", &fakeStore{}, Meta{})
-	a.hostname = func() (string, error) { return "", errors.New("uts gone") }
-	if err := a.openNovelty(); err == nil || !strings.Contains(err.Error(), "set output.entity") {
-		t.Errorf("a host name that cannot be read must stop startup with advice, got %v", err)
-	}
-	a.hostname = func() (string, error) { return "has space", nil }
-	if err := a.openNovelty(); err == nil {
-		t.Error("a host name that is not a valid entity must stop startup")
-	}
-	c.Output.EntityKind, c.Output.Entity = "ip", "192.0.2.10"
-	a = New(c, "", &fakeStore{}, Meta{})
 	if err := a.openNovelty(); err != nil {
 		t.Fatal(err)
 	}
-	if a.sink != nil || a.novelty == nil || a.ident.Entity != "192.0.2.10" || a.ident.EntityKind != "ip" {
-		t.Errorf("no path: dedupe-only emitter and the configured entity; got sink=%v ident=%+v", a.sink, a.ident)
+	if a.sink != nil || a.novelty == nil {
+		t.Errorf("no path: an emitter without a sink; got sink=%v", a.sink)
 	}
 	// An emitter without a sink must not panic on emit.
 	a.reportUnlearned(shell(1), []string{"k"})
 
 	c.Output.NoveltyPath = filepath.Join(t.TempDir(), "x", "n.jsonl")
+	c.Output.TLP, c.Output.EntityKind, c.Output.Entity = "green", "ip", "192.0.2.10"
 	os.MkdirAll(c.Output.NoveltyPath, 0o700) // a directory where the file should be
 	a = New(c, "", &fakeStore{}, Meta{})
 	if err := a.openNovelty(); err == nil {
 		t.Error("a sink that cannot be opened must stop startup")
+	}
+}
+
+// B1: an empty or thin baseline in alert/enforce must not turn every event
+// into an unlearned row (it flooded the sink and made the host corroborate
+// every lake finding). The state is reported instead.
+func TestEmptyBaselineWritesNoUnlearnedRows(t *testing.T) {
+	for _, learn := range []int{0, 10} {
+		a, auditPath, novPath := outputApp(t, mode.Alert)
+		a.cfg.Learn.MinBaselineSamples = config.Default().Learn.MinBaselineSamples
+		for i := 0; i < learn; i++ {
+			for k, v := range a.execExtract.Extract(model.Event{Kind: kind.Exec, Comm: "cron", ParentComm: "systemd"}) {
+				a.profile.Observe(k, v)
+			}
+		}
+		logs := captureLog(t)
+		a.announceBaseline()
+		for i := 0; i < 400; i++ {
+			ev := shell(int32(1000 + i))
+			ev.Net.DestPort = uint16(1 + i)
+			a.handle(ev)
+		}
+		want := map[int]string{0: "no_baseline", 10: "warming"}[learn]
+		if rows := novelRows(t, novPath); len(rows) != 0 {
+			t.Errorf("%s: %d rows from 400 events, want 0", want, len(rows))
+		}
+		if !strings.Contains(logs.String(), "BASELINE NOT READY state="+want) {
+			t.Errorf("startup must say the baseline is %s:\n%s", want, logs.String())
+		}
+		if st := a.Status(); st.BaselineState != want || st.Unlearned != 0 {
+			t.Errorf("status = %+v", st)
+		}
+		if err := a.announceStartup(nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if r := recordsOfKind(t, auditPath, audit.KindStartup); r[0].BaselineState != want {
+			t.Errorf("startup baseline_state = %q, want %q", r[0].BaselineState, want)
+		}
+		if h := a.heartbeat(time.Now()).Health; h.BaselineState != want {
+			t.Errorf("heartbeat baseline_state = %q", h.BaselineState)
+		}
+	}
+}
+
+// Even with a ready baseline, a flood of never-seen values is capped per
+// profile and bucket: N rows and one burst row.
+func TestUnlearnedFloodBecomesABurst(t *testing.T) {
+	a, _, novPath := outputApp(t, mode.Alert)
+	for k, v := range a.execExtract.Extract(model.Event{Kind: kind.Exec, Comm: "cron", ParentComm: "systemd"}) {
+		a.profile.Observe(k, v)
+	}
+	for i := 0; i < 400; i++ {
+		ev := shell(int32(1000 + i))
+		ev.Net.DestPort = uint16(1 + i)
+		a.handle(ev)
+	}
+	rows := novelRows(t, novPath)
+	if len(rows) != 21 || rows[20].Status != novelty.StatusBurst || rows[20].Count != 21 {
+		t.Fatalf("rows = %d, want 20 unlearned + 1 burst", len(rows))
+	}
+	if h := a.heartbeat(time.Now()).Health; h.NoveltyOverCap != 380 {
+		t.Errorf("over cap = %d, want 380", h.NoveltyOverCap)
 	}
 }
 
@@ -261,7 +317,7 @@ func TestHeartbeat(t *testing.T) {
 		a.handle(ev)
 	}
 	learnEgress(a)
-	a.handle(shell(9)) // one finding row; the exec events above were one unlearned row
+	a.handle(shell(9)) // one finding row (the exec events above met an empty baseline: no rows)
 
 	e := a.heartbeat(start.Add(60 * time.Second))
 	h := e.Health
@@ -274,8 +330,8 @@ func TestHeartbeat(t *testing.T) {
 	if h.EnrichLagMsMax != 2 || h.EnrichLagMsAvg < 0.9 || h.EnrichLagMsAvg > 1.1 {
 		t.Errorf("lag avg %.2f max %.2f, want ~1 and 2", h.EnrichLagMsAvg, h.EnrichLagMsMax)
 	}
-	if h.NoveltyRows != 2 || h.NoveltySuppressed != 119 {
-		t.Errorf("novelty rows = %d suppressed = %d, want 2 and 119", h.NoveltyRows, h.NoveltySuppressed)
+	if h.NoveltyRows != 1 || h.NoveltySuppressed != 0 || h.BaselineState != "ready" {
+		t.Errorf("novelty rows = %d suppressed = %d state = %s, want 1, 0, ready", h.NoveltyRows, h.NoveltySuppressed, h.BaselineState)
 	}
 
 	h2 := a.heartbeat(start.Add(120 * time.Second)).Health

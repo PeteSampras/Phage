@@ -99,7 +99,14 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 		// so a freshly-deployed agent never raises confident alerts off a thin
 		// baseline; mature features (>= minConfidentSamples) are unaffected.
 		conf := confidence(samples)
-		terms := verdict.Reason{Surprise: s, Confidence: conf, Support: a.profile.Count(key, val), Samples: samples}
+		support := a.profile.Count(key, val)
+		// A value refused at the per-feature cap was never learned, whatever
+		// the host did: trust its novelty less, and say why.
+		capped := s > 0 && support == 0 && a.profile.AtCap(key)
+		if capped {
+			conf *= cappedConfidence
+		}
+		terms := verdict.Reason{Surprise: s, Confidence: conf, Support: support, Samples: samples}
 
 		if overrideFeatures[key] {
 			// Floor the score by the flag's own learned surprise; keep it out of
@@ -112,7 +119,7 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 				floor = f
 			}
 			r := terms
-			r.Feature, r.Contribution, r.Detail = key, f, explain(key, val, s)
+			r.Feature, r.Contribution, r.Detail = key, f, detail(key, val, s, capped)
 			out.Reasons = append(out.Reasons, r)
 			continue
 		}
@@ -131,7 +138,7 @@ func (a *Anomaly) Score(v feature.Vector) verdict.Verdict {
 		}
 		score += contribution
 		r := terms
-		r.Feature, r.Contribution, r.Detail = key, contribution, explain(key, val, s)
+		r.Feature, r.Contribution, r.Detail = key, contribution, detail(key, val, s, capped)
 		out.Reasons = append(out.Reasons, r)
 	}
 	if weightSum > 0 {
@@ -153,6 +160,18 @@ const minConfidentSamples = 15
 // happens inside an interactive login session (expected admin activity), so it
 // does not dominate the score. Service (no-session) execs are not discounted.
 const execInteractiveDiscount = 0.3
+
+// cappedConfidence discounts a value that is novel only in the sense that the
+// feature had reached learn.max_values_per_key and could learn no more.
+const cappedConfidence = 0.5
+
+func detail(key string, val, surprise float64, capped bool) string {
+	d := explain(key, val, surprise)
+	if capped {
+		d += " [feature at cap; value not learned]"
+	}
+	return d
+}
 
 func confidence(samples uint64) float64 {
 	if samples >= minConfidentSamples {

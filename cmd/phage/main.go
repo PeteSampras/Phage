@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"syscall"
 
 	"github.com/AzozzALFiras/Phage/internal/analysis/baseline"
 	"github.com/AzozzALFiras/Phage/internal/control"
@@ -56,8 +57,11 @@ func cmdStatus(sock string) {
 
 // formatHealth renders the sensor-health part of a status reply.
 func formatHealth(s control.Status) string {
-	drops := strconv.FormatUint(s.Drops, 10)
-	if s.DropsError != "" {
+	drops := "unknown"
+	switch {
+	case s.Drops != nil:
+		drops = strconv.FormatUint(*s.Drops, 10)
+	case s.DropsError != "":
 		drops = "unknown (" + logsafe.Clean(s.DropsError) + ")"
 	}
 	hb := s.LastHeartbeat
@@ -66,8 +70,8 @@ func formatHealth(s control.Status) string {
 	}
 	out := fmt.Sprintf("drops=%s events_per_sec=%.2f enrich_lag_ms=%.2f last_heartbeat=%s\n",
 		drops, s.EventsPerSec, s.EnrichLagMs, hb)
-	out += fmt.Sprintf("baseline_sha256=%s baseline_overflow=%d unlearned=%d\n",
-		orDash(s.BaselineSHA256), s.Overflow, s.Unlearned)
+	out += fmt.Sprintf("baseline_state=%s baseline_sha256=%s baseline_overflow=%d unlearned=%d\n",
+		orDash(s.BaselineState), orDash(s.BaselineSHA256), s.Overflow, s.Unlearned)
 	if s.NoveltyPath != "" {
 		out += fmt.Sprintf("novelty=%s rows=%d errors=%d\n", s.NoveltyPath, s.NoveltyRows, s.NoveltyErrors)
 	}
@@ -112,7 +116,7 @@ func cmdBaseline(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "%s sha256=%s\n", files[0], sum)
+		fmt.Fprintf(stdout, "%s sha256=%s\n", logsafe.Clean(files[0]), sum)
 		baseline.WriteSummary(stdout, s)
 		return 0
 	case sub == "diff" && len(files) == 2:
@@ -126,7 +130,7 @@ func cmdBaseline(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "old %s sha256=%s\nnew %s sha256=%s\n", files[0], oldSum, files[1], newSum)
+		fmt.Fprintf(stdout, "old %s sha256=%s\nnew %s sha256=%s\n", logsafe.Clean(files[0]), oldSum, logsafe.Clean(files[1]), newSum)
 		fmt.Fprintln(stdout, "(values are as learned: ports and flags as numbers, program/pair/class names as hash ids)")
 		baseline.WriteDiff(stdout, baseline.Diff(oldS, newS), *maxValues)
 		return 0
@@ -136,11 +140,18 @@ func cmdBaseline(args []string, stdout, stderr io.Writer) int {
 }
 
 func readBaseline(path string) (baseline.Snapshot, string, error) {
-	f, err := os.Open(path)
+	// O_NONBLOCK: a FIFO opens without waiting for a writer, and is then
+	// refused below instead of hanging the command.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return baseline.Snapshot{}, "", err
 	}
 	defer f.Close()
+	if fi, err := f.Stat(); err != nil {
+		return baseline.Snapshot{}, "", err
+	} else if !fi.Mode().IsRegular() {
+		return baseline.Snapshot{}, "", errors.New(logsafe.Clean(path) + ": not a regular file")
+	}
 	b, err := io.ReadAll(io.LimitReader(f, maxBaselineBytes+1))
 	if err != nil {
 		return baseline.Snapshot{}, "", fmt.Errorf("read %s: %w", path, err)
@@ -150,7 +161,7 @@ func readBaseline(path string) (baseline.Snapshot, string, error) {
 	}
 	s, err := baseline.ParseSnapshot(b)
 	if err != nil {
-		return baseline.Snapshot{}, "", fmt.Errorf("%s is not a valid baseline: %w", path, err)
+		return baseline.Snapshot{}, "", fmt.Errorf("%s is not a valid baseline: %w", logsafe.Clean(path), err)
 	}
 	sum := sha256.Sum256(b)
 	return s, hex.EncodeToString(sum[:]), nil

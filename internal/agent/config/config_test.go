@@ -251,11 +251,11 @@ func TestLoadRejectsBadReleaseAfter(t *testing.T) {
 func TestOutputAndLearnDefaults(t *testing.T) {
 	c := Default()
 	o := c.Output
-	if o.NoveltyPath != "/var/lib/phage/novelty.jsonl" || o.Source != "phage-host" || o.EntityKind != "host" ||
-		o.Entity != "" || o.TLP != "red" || o.HeartbeatInterval != 60 || o.NoveltyBucket != time.Hour {
-		t.Errorf("output defaults = %+v", o)
+	if o.NoveltyPath != "" || o.Source != "phage-host" || o.EntityKind != "" || o.Entity != "" || o.TLP != "" ||
+		o.HeartbeatInterval != 60 || o.NoveltyBucket != time.Hour || o.NoveltyMaxPerBucket != 20 {
+		t.Errorf("output defaults = %+v (the sink is opt-in: no path, no label, no entity)", o)
 	}
-	if c.Learn.CheckpointInterval != 10*time.Minute || c.Learn.MaxValuesPerKey != 10000 {
+	if c.Learn.CheckpointInterval != 10*time.Minute || c.Learn.MaxValuesPerKey != 10000 || c.Learn.MinBaselineSamples != 5000 {
 		t.Errorf("learn defaults = %+v", c.Learn)
 	}
 	if err := c.Validate(); err != nil {
@@ -266,6 +266,8 @@ func TestOutputAndLearnDefaults(t *testing.T) {
 	}
 }
 
+const sinkOn = "output:\n  novelty_path: /tmp/n.jsonl\n"
+
 func TestLoadOutputAndLearn(t *testing.T) {
 	p := writeTemp(t, `
 mode: alert
@@ -273,6 +275,7 @@ output:
   novelty_path: /tmp/n.jsonl
   novelty_max_bytes: 0
   novelty_bucket: 30m
+  novelty_max_per_bucket: 5
   source: phage-canary
   entity_kind: ip
   entity: 192.0.2.10
@@ -281,40 +284,47 @@ output:
 learn:
   checkpoint_interval: 5m
   max_values_per_key: 50
+  min_baseline_samples: 100
 `)
 	c, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := Output{NoveltyPath: "/tmp/n.jsonl", NoveltyBucket: 30 * time.Minute, Source: "phage-canary",
-		EntityKind: "ip", Entity: "192.0.2.10", TLP: "amber+strict", HeartbeatInterval: 30}
+		EntityKind: "ip", Entity: "192.0.2.10", TLP: "amber+strict", HeartbeatInterval: 30, NoveltyMaxPerBucket: 5}
 	if c.Output != want {
 		t.Errorf("output = %+v, want %+v", c.Output, want)
 	}
-	if c.Learn != (Learn{CheckpointInterval: 5 * time.Minute, MaxValuesPerKey: 50}) {
+	if c.Learn != (Learn{CheckpointInterval: 5 * time.Minute, MaxValuesPerKey: 50, MinBaselineSamples: 100}) {
 		t.Errorf("learn = %+v", c.Learn)
 	}
 }
 
 func TestOutputRefusals(t *testing.T) {
+	full := sinkOn + "  entity_kind: host\n  entity: web01\n"
 	for name, body := range map[string]string{
-		"tlp prefixed":        "output:\n  tlp: TLP:AMBER\n",
-		"tlp upper case":      "output:\n  tlp: AMBER\n",
-		"tlp v1 white":        "output:\n  tlp: white\n",
-		"tlp empty":           "output:\n  tlp: \"\"\n",
+		"sink without tlp":    sinkOn + "  entity_kind: host\n  entity: web01\n",
+		"sink without entity": sinkOn + "  tlp: amber\n",
+		"sink without kind":   sinkOn + "  tlp: amber\n  entity: web01\n",
+		"tlp red":             full + "  tlp: red\n",
+		"tlp prefixed":        full + "  tlp: TLP:AMBER\n",
+		"tlp upper case":      full + "  tlp: AMBER\n",
+		"tlp v1 white":        full + "  tlp: white\n",
+		"tlp red, sink off":   "output:\n  tlp: red\n",
+		"host upper case":     sinkOn + "  tlp: amber\n  entity_kind: host\n  entity: Web01\n",
 		"source with space":   "output:\n  source: phage host\n",
 		"source upper":        "output:\n  source: Phage\n",
 		"source lake":         "output:\n  source: lake-novelty\n",
 		"source too long":     "output:\n  source: " + strings.Repeat("a", 65) + "\n",
-		"unknown kind":        "output:\n  entity_kind: vm\n",
+		"unknown kind":        "output:\n  entity_kind: vm\n  entity: x\n",
 		"ip without entity":   "output:\n  entity_kind: ip\n",
 		"ip not an address":   "output:\n  entity_kind: ip\n  entity: web01\n",
 		"ip not canonical":    "output:\n  entity_kind: ip\n  entity: \"2001:DB8::1\"\n",
-		"user without entity": "output:\n  entity_kind: user\n",
-		"entity with space":   "output:\n  entity: \"web 01\"\n",
+		"entity with space":   "output:\n  entity_kind: host\n  entity: \"web 01\"\n",
 		"tiny rotation":       "output:\n  novelty_max_bytes: 1000\n",
 		"bucket too small":    "output:\n  novelty_bucket: 10s\n",
 		"bucket not duration": "output:\n  novelty_bucket: hourly\n",
+		"per-bucket zero":     "output:\n  novelty_max_per_bucket: 0\n",
 		"heartbeat zero":      "output:\n  heartbeat_interval: 0\n",
 		"unknown output key":  "output:\n  novelty: true\n",
 		"checkpoint tiny":     "learn:\n  checkpoint_interval: 1s\n",
@@ -325,13 +335,16 @@ func TestOutputRefusals(t *testing.T) {
 			t.Errorf("%s: accepted %q", name, body)
 		}
 	}
-	// Every canonical label is accepted.
-	for _, l := range TLPLabels {
-		if _, err := Load(writeTemp(t, "output:\n  tlp: "+l+"\n")); err != nil {
+	for _, l := range []string{"clear", "green", "amber", "amber+strict"} {
+		if _, err := Load(writeTemp(t, full+"  tlp: "+l+"\n")); err != nil {
 			t.Errorf("tlp %q refused: %v", l, err)
 		}
 	}
-	if _, err := Load(writeTemp(t, "output:\n  entity_kind: ip\n  entity: \"2001:db8::1\"\n")); err != nil {
+	if _, err := Load(writeTemp(t, sinkOn+"  tlp: amber\n  entity_kind: ip\n  entity: \"2001:db8::1\"\n")); err != nil {
 		t.Errorf("canonical v6 refused: %v", err)
+	}
+	_, err := Load(writeTemp(t, full+"  tlp: red\n"))
+	if err == nil || !strings.Contains(err.Error(), "never be written to the lake") {
+		t.Errorf("red must be refused with the reason, got %v", err)
 	}
 }

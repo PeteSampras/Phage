@@ -86,7 +86,7 @@ type Dev struct {
 // Output configures what phaged reports for other systems to read. Nothing in
 // it acts on the host: it only writes files phaged owns.
 type Output struct {
-	// NoveltyPath is the JSON-lines file that receives one novelty_finding row
+	// NoveltyPath (opt-in; empty by default) is the JSON-lines file that receives one novelty_finding row
 	// (homelab-next ADR-0036) per verdict at or above the notify threshold, and
 	// one `unlearned` row when an event's feature class has no baseline. Written
 	// only in alert and enforce mode. Empty disables it.
@@ -101,13 +101,18 @@ type Output struct {
 	// Source names this sensor in the row's `source` column.
 	Source string
 	// EntityKind and Entity name the host in the shared entity namespace
-	// (ADR-0036 decision 7). Entity empty with kind host means the host name at
-	// startup; any other kind needs Entity set.
+	// (ADR-0036 decision 7), as the lake's profiles name it. Both are required
+	// when NoveltyPath is set; there is no default (a host name rarely matches
+	// what a lake profile uses).
 	EntityKind string
 	Entity     string
-	// TLP is the TLP 2.0 label every row carries. It defaults to red (see
-	// DefaultTLP); only the five canonical lower-case labels are accepted.
+	// TLP is the TLP 2.0 label every row carries. Required when NoveltyPath is
+	// set; one of the canonical lower-case labels except red (a red row can
+	// never be written to the lake: its writers read below red).
 	TLP string
+	// NoveltyMaxPerBucket caps the new rows one profile may write in one uid
+	// bucket; past it, one `burst` row with the count stands for the rest.
+	NoveltyMaxPerBucket int
 	// HeartbeatInterval is the number of seconds between `heartbeat` audit
 	// records (sensor health), written in every mode.
 	HeartbeatInterval int
@@ -118,6 +123,10 @@ type Learn struct {
 	// CheckpointInterval is how often learn mode saves the baseline (atomic
 	// temp file + rename) while running, so a crash loses at most one interval.
 	CheckpointInterval time.Duration
+	// MinBaselineSamples is the total feature observations below which the
+	// baseline is `warming` (0: `no_baseline`). Until it is reached, events of
+	// a never-seen feature class are not reported as unlearned.
+	MinBaselineSamples uint64
 	// MaxValuesPerKey caps the distinct values one feature key may learn; a new
 	// value past the cap is counted as overflow and not learned.
 	MaxValuesPerKey int
@@ -135,14 +144,10 @@ var (
 
 // Defaults for the output and learn blocks.
 const (
+	// DefaultNoveltyPath is the conventional path for the opt-in sink.
 	DefaultNoveltyPath     = "/var/lib/phage/novelty.jsonl"
 	DefaultNoveltyMaxBytes = 64 << 20
 	DefaultSource          = "phage-host"
-	// DefaultTLP is red: a row names host paths, addresses and programs, and
-	// red is the label that can never over-share. It is also invisible to a
-	// lake reader below red (homelab-next's corroborate), so set output.tlp
-	// explicitly to share rows (docs/wazuh.md, FORK.md).
-	DefaultTLP = "red"
 	// lakeSource is the lake analyzer's own source; a host sensor must not
 	// write under it (corroborate counts distinct sources).
 	lakeSource = "lake-novelty"
@@ -250,15 +255,13 @@ func Default() Config {
 		Thresholds:   Thresholds{Notify: 0.4, Contain: 0.8},
 		ReleaseAfter: 300,
 		Output: Output{
-			NoveltyPath:       DefaultNoveltyPath,
-			NoveltyMaxBytes:   DefaultNoveltyMaxBytes,
-			NoveltyBucket:     time.Hour,
-			Source:            DefaultSource,
-			EntityKind:        "host",
-			TLP:               DefaultTLP,
-			HeartbeatInterval: 60,
+			NoveltyMaxPerBucket: 20,
+			NoveltyMaxBytes:     DefaultNoveltyMaxBytes,
+			NoveltyBucket:       time.Hour,
+			Source:              DefaultSource,
+			HeartbeatInterval:   60,
 		},
-		Learn: Learn{CheckpointInterval: 10 * time.Minute, MaxValuesPerKey: 10000},
+		Learn: Learn{CheckpointInterval: 10 * time.Minute, MaxValuesPerKey: 10000, MinBaselineSamples: 5000},
 		// Enforcement, Deception, Dev: zero value — nothing acts.
 	}
 }
@@ -304,18 +307,20 @@ type fileConfig struct {
 	} `yaml:"dev"`
 	ReleaseAfter *int `yaml:"release_after"`
 	Output       *struct {
-		NoveltyPath       *string `yaml:"novelty_path"`
-		NoveltyMaxBytes   *int64  `yaml:"novelty_max_bytes"`
-		NoveltyBucket     *string `yaml:"novelty_bucket"`
-		Source            *string `yaml:"source"`
-		EntityKind        *string `yaml:"entity_kind"`
-		Entity            *string `yaml:"entity"`
-		TLP               *string `yaml:"tlp"`
-		HeartbeatInterval *int    `yaml:"heartbeat_interval"`
+		NoveltyPath         *string `yaml:"novelty_path"`
+		NoveltyMaxBytes     *int64  `yaml:"novelty_max_bytes"`
+		NoveltyBucket       *string `yaml:"novelty_bucket"`
+		Source              *string `yaml:"source"`
+		EntityKind          *string `yaml:"entity_kind"`
+		Entity              *string `yaml:"entity"`
+		TLP                 *string `yaml:"tlp"`
+		NoveltyMaxPerBucket *int    `yaml:"novelty_max_per_bucket"`
+		HeartbeatInterval   *int    `yaml:"heartbeat_interval"`
 	} `yaml:"output"`
 	Learn *struct {
 		CheckpointInterval *string `yaml:"checkpoint_interval"`
 		MaxValuesPerKey    *int    `yaml:"max_values_per_key"`
+		MinBaselineSamples *uint64 `yaml:"min_baseline_samples"`
 	} `yaml:"learn"`
 }
 
@@ -386,6 +391,9 @@ func Load(path string) (Config, error) {
 		setString(&cfg.Output.EntityKind, o.EntityKind)
 		setString(&cfg.Output.Entity, o.Entity)
 		setString(&cfg.Output.TLP, o.TLP)
+		if o.NoveltyMaxPerBucket != nil {
+			cfg.Output.NoveltyMaxPerBucket = *o.NoveltyMaxPerBucket
+		}
 		if o.HeartbeatInterval != nil {
 			cfg.Output.HeartbeatInterval = *o.HeartbeatInterval
 		}
@@ -393,6 +401,9 @@ func Load(path string) (Config, error) {
 	if l := fc.Learn; l != nil {
 		if err := setDuration(&cfg.Learn.CheckpointInterval, l.CheckpointInterval); err != nil {
 			return Config{}, fmt.Errorf("config %q: learn.checkpoint_interval: %w", path, err)
+		}
+		if l.MinBaselineSamples != nil {
+			cfg.Learn.MinBaselineSamples = *l.MinBaselineSamples
 		}
 		if l.MaxValuesPerKey != nil {
 			cfg.Learn.MaxValuesPerKey = *l.MaxValuesPerKey
@@ -445,21 +456,28 @@ func (c Config) Validate() error {
 }
 
 func (o Output) validate() error {
-	if !contains(TLPLabels, o.TLP) {
-		return fmt.Errorf("output.tlp %q is not a TLP 2.0 label: use one of %s, exactly (lower case, no TLP: prefix)",
-			o.TLP, strings.Join(TLPLabels, ", "))
-	}
 	if len(o.Source) > 64 || !sourcePattern.MatchString(o.Source) {
 		return fmt.Errorf("output.source %q must be lower-case words joined by single hyphens (at most 64 characters)", o.Source)
 	}
 	if o.Source == lakeSource {
 		return fmt.Errorf("output.source %q is the lake analyzer's own source; a host sensor needs its own", o.Source)
 	}
-	if !contains(EntityKinds, o.EntityKind) {
-		return fmt.Errorf("output.entity_kind %q must be one of %s", o.EntityKind, strings.Join(EntityKinds, ", "))
+	// TLP and entity are checked whenever given, and required with the sink.
+	if o.TLP != "" || o.NoveltyPath != "" {
+		if err := ValidateTLP(o.TLP); err != nil {
+			return err
+		}
 	}
-	if err := ValidateEntity(o.EntityKind, o.Entity, o.EntityKind == "host"); err != nil {
-		return err
+	if o.EntityKind != "" || o.Entity != "" || o.NoveltyPath != "" {
+		if !contains(EntityKinds, o.EntityKind) {
+			return fmt.Errorf("output.entity_kind %q must be one of %s (required with output.novelty_path)", o.EntityKind, strings.Join(EntityKinds, ", "))
+		}
+		if err := ValidateEntity(o.EntityKind, o.Entity, false); err != nil {
+			return err
+		}
+	}
+	if o.NoveltyMaxPerBucket < 1 || o.NoveltyMaxPerBucket > 100000 {
+		return fmt.Errorf("output.novelty_max_per_bucket %d must be between 1 and 100000", o.NoveltyMaxPerBucket)
 	}
 	if o.NoveltyMaxBytes != 0 && o.NoveltyMaxBytes < 1<<20 {
 		return fmt.Errorf("output.novelty_max_bytes %d must be 0 (never rotate) or at least 1048576", o.NoveltyMaxBytes)
@@ -469,6 +487,23 @@ func (o Output) validate() error {
 	}
 	if o.HeartbeatInterval < 5 || o.HeartbeatInterval > 3600 {
 		return fmt.Errorf("output.heartbeat_interval %d must be between 5 and 3600 seconds", o.HeartbeatInterval)
+	}
+	return nil
+}
+
+// ValidateTLP accepts the labels a novelty row may carry: the canonical TLP
+// 2.0 labels, lower case, except red. A red row cannot reach the lake: the
+// lake's analyzer-output writers read below red (homelab-next ADR-0036), and
+// rows that can never be written must not be produced. There is no default.
+func ValidateTLP(l string) error {
+	if l == "" {
+		return fmt.Errorf("output.tlp is required with output.novelty_path: one of clear, green, amber, amber+strict")
+	}
+	if l == "red" {
+		return fmt.Errorf("output.tlp red is refused: a red novelty row can never be written to the lake (its writers read below red); use amber+strict or lower")
+	}
+	if !contains(TLPLabels, l) {
+		return fmt.Errorf("output.tlp %q is not a TLP 2.0 label: use one of clear, green, amber, amber+strict, exactly (lower case, no TLP: prefix)", l)
 	}
 	return nil
 }
@@ -491,6 +526,9 @@ func ValidateEntity(kind, entity string, emptyOK bool) error {
 		if unicode.IsControl(r) || unicode.IsSpace(r) {
 			return fmt.Errorf("output.entity %q must not contain spaces or control characters", entity)
 		}
+	}
+	if kind == "host" && strings.ToLower(entity) != entity {
+		return fmt.Errorf("output.entity %q: write a host name in lower case (%q), as the lake does", entity, strings.ToLower(entity))
 	}
 	if kind == "ip" {
 		a, err := netip.ParseAddr(entity)

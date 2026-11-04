@@ -58,6 +58,7 @@ type Entry struct {
 	// Startup and heartbeat: the baseline in use (sha256 of the file's bytes;
 	// "none" for a fresh host) and where novelty rows go.
 	BaselineSHA256 string `json:"baseline_sha256,omitempty"`
+	BaselineState  string `json:"baseline_state,omitempty"` // no_baseline | warming | ready
 	NoveltyPath    string `json:"novelty_path,omitempty"`
 	NoveltyEntity  string `json:"novelty_entity,omitempty"` // entity_kind:entity
 	TLP            string `json:"tlp,omitempty"`            // the novelty rows' label
@@ -83,10 +84,13 @@ type Health struct {
 	EnrichLagMsMax float64 `json:"enrich_lag_ms_max"`
 	// Novelty sink, in the interval.
 	NoveltyRows       uint64 `json:"novelty_rows"`
-	NoveltySuppressed uint64 `json:"novelty_suppressed"` // duplicates within one uid bucket
+	NoveltySuppressed uint64 `json:"novelty_suppressed"` // repeats of a remembered uid
+	NoveltyOverCap    uint64 `json:"novelty_over_cap"`   // new rows past the per-bucket cap (one burst row each bucket)
 	NoveltyErrors     uint64 `json:"novelty_errors"`
 	// Baseline, cumulative since start.
 	BaselineOverflow uint64 `json:"baseline_overflow"`
+	BaselineSamples  uint64 `json:"baseline_samples"` // feature observations in the baseline
+	BaselineState    string `json:"baseline_state"`   // no_baseline | warming | ready
 	CheckpointErrors uint64 `json:"checkpoint_errors"`
 }
 
@@ -115,7 +119,8 @@ func Open(path string) (*Writer, error) {
 // The final component is opened O_NOFOLLOW so a planted symlink cannot
 // redirect root's appends, O_NONBLOCK so a FIFO planted there fails instead of
 // hanging startup, only a regular file is accepted, and a pre-existing file
-// with looser permissions is tightened. The audit trail and the novelty sink
+// with looser permissions is tightened. A pre-existing file must be owned by
+// the daemon's euid and have exactly one link. The audit trail and the novelty sink
 // both open their files this way.
 func OpenAppendFile(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -144,6 +149,19 @@ func openExisting(path string, flags int) (*os.File, error) {
 	if !fi.Mode().IsRegular() {
 		f.Close()
 		return nil, errors.New("not a regular file")
+	}
+	// Only a file this daemon owns, with no other name: a hard link planted
+	// at the path (to a file elsewhere, or owned by someone else) would have
+	// root append to, and tighten, a file it never meant to write.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if int(st.Uid) != os.Geteuid() {
+			f.Close()
+			return nil, fmt.Errorf("owned by uid %d, not by this daemon (uid %d)", st.Uid, os.Geteuid())
+		}
+		if uint64(st.Nlink) != 1 {
+			f.Close()
+			return nil, fmt.Errorf("has %d hard links; refusing a file with another name", st.Nlink)
+		}
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		if err := f.Chmod(0o600); err != nil {

@@ -104,6 +104,21 @@ func (s *Store) Save(p *baseline.Profile) error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("rename into place: %w", err)
 	}
+	// The rename is durable only once the directory is: without this a
+	// power loss can bring back the previous file (or none).
+	if err := syncDir(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("sync state dir: %w", err)
+	}
 	s.setDigest(b)
 	return nil
+}
+
+// syncDir fsyncs a directory (its entries: a rename into it).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

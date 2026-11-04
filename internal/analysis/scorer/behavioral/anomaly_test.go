@@ -233,3 +233,27 @@ func TestReasonsCarryTheirTerms(t *testing.T) {
 		t.Errorf("terms = support %d samples %d surprise %v confidence %v", r.Support, r.Samples, r.Surprise, r.Confidence)
 	}
 }
+
+// A value refused at the per-feature cap is discounted and says why.
+func TestCappedValueIsDiscountedAndExplained(t *testing.T) {
+	p := baseline.NewProfile()
+	p.SetMaxValuesPerKey(1)
+	for i := 0; i < 20; i++ {
+		p.Observe(feature.FeatNetEgressPort, 443)
+	}
+	free := baseline.NewProfile()
+	for i := 0; i < 20; i++ {
+		free.Observe(feature.FeatNetEgressPort, 443)
+	}
+	capped := New(p).Score(feature.Vector{feature.FeatNetEgressPort: 22})
+	normal := New(free).Score(feature.Vector{feature.FeatNetEgressPort: 22})
+	if capped.Reasons[0].Confidence != 0.5 || normal.Reasons[0].Confidence != 1 {
+		t.Errorf("confidence capped %v, uncapped %v", capped.Reasons[0].Confidence, normal.Reasons[0].Confidence)
+	}
+	if !strings.Contains(capped.Reasons[0].Detail, "feature at cap; value not learned") || strings.Contains(normal.Reasons[0].Detail, "cap") {
+		t.Errorf("details %q / %q", capped.Reasons[0].Detail, normal.Reasons[0].Detail)
+	}
+	if capped.Score >= normal.Score {
+		t.Errorf("capped score %v must be below %v", capped.Score, normal.Score)
+	}
+}

@@ -100,3 +100,27 @@ func TestOpenRefusesDeviceNode(t *testing.T) {
 		t.Skipf("device refused before the regular-file check (e.g. a nodev mount): %v", err)
 	}
 }
+
+func TestOpenRefusesHardLinkAndForeignOwner(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	os.WriteFile(victim, []byte("x"), 0o600)
+	link := filepath.Join(dir, "audit.jsonl")
+	if err := os.Link(victim, link); err != nil {
+		t.Skip(err)
+	}
+	if _, err := Open(link); err == nil || !strings.Contains(err.Error(), "hard links") {
+		t.Errorf("a hard-linked trail must be refused, got %v", err)
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("chown needs root")
+	}
+	other := filepath.Join(dir, "other.jsonl")
+	os.WriteFile(other, nil, 0o600)
+	if err := os.Chown(other, 4242, 4242); err != nil {
+		t.Skip(err)
+	}
+	if _, err := Open(other); err == nil || !strings.Contains(err.Error(), "owned by uid 4242") {
+		t.Errorf("a trail owned by another uid must be refused, got %v", err)
+	}
+}

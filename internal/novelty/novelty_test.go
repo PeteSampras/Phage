@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -274,7 +275,7 @@ func (f *failingWriter) Write(r Row) error {
 func TestEmitterDedupesAndCounts(t *testing.T) {
 	w := &failingWriter{}
 	var logged []string
-	e := NewEmitter(w, time.Hour, func(f string, a ...any) { logged = append(logged, f) })
+	e := NewEmitter(w, testID, 0, func(f string, a ...any) { logged = append(logged, f) })
 	now := evTime
 	e.now = func() time.Time { return now }
 	r := testID.Finding(events()["exec"], learned(), testSHA, emitAt)
@@ -332,12 +333,102 @@ func TestSinkWriteErrorIsReturned(t *testing.T) {
 }
 
 func TestEmitterWithoutSinkOnlyDedupes(t *testing.T) {
-	e := NewEmitter(nil, time.Hour, t.Logf)
+	e := NewEmitter(nil, testID, 0, t.Logf)
 	r := testID.Finding(events()["exec"], learned(), testSHA, emitAt)
 	if !e.Emit(r) || e.Emit(r) {
 		t.Fatal("dedupe must work without a sink")
 	}
 	if c := e.Counters(); c.Rows != 0 || c.Suppressed != 1 {
 		t.Errorf("counters = %+v: nothing was written", c)
+	}
+}
+
+func TestBurstRowSatisfiesTheSchema(t *testing.T) {
+	r := testID.Finding(events()["connect-v4"], learned(), testSHA, emitAt)
+	b := testID.Burst(r, 21, emitAt)
+	validateRow(t, b)
+	if b.Status != StatusBurst || b.Value != "" || b.Score != nil || b.Count != 21 || b.UID == r.UID ||
+		!strings.HasSuffix(b.Message, "(burst)") {
+		t.Errorf("burst = %+v", b)
+	}
+	other := events()["connect-v4"]
+	other.Net.DestPort = 9
+	if testID.Burst(testID.Finding(other, learned(), testSHA, emitAt), 21, emitAt).UID != b.UID {
+		t.Error("one burst uid per profile, entity and bucket, whatever value tripped it")
+	}
+}
+
+// A flood of distinct values (a scan, or a host whose baseline lacks a whole
+// class) is bounded per profile and bucket: N rows, then one burst row.
+func TestEmitterCapsNewRowsPerProfileAndBucket(t *testing.T) {
+	w := &failingWriter{}
+	e := NewEmitter(w, testID, 3, t.Logf)
+	now := evTime
+	e.now = func() time.Time { return now }
+	ev := events()["connect-v4"]
+	for port := 1; port <= 50; port++ {
+		ev.Net.DestPort = uint16(port)
+		e.Emit(testID.Unlearned(ev, []string{"k"}, testSHA, emitAt))
+	}
+	e.Emit(testID.Finding(events()["exec"], learned(), testSHA, emitAt)) // another profile is not capped
+	if len(w.rows) != 5 || w.rows[3].Status != StatusBurst || w.rows[3].Count != 4 || w.rows[4].Profile != "exec" {
+		t.Fatalf("rows = %d (want 3 + burst + exec): %+v", len(w.rows), w.rows)
+	}
+	if c := e.Counters(); c.OverCap != 47 || c.Bursts != 1 || c.Rows != 5 {
+		t.Errorf("counters = %+v", c)
+	}
+	// The next bucket starts a new count.
+	later := ev
+	later.Time = ev.Time.Add(time.Hour)
+	now = now.Add(time.Hour)
+	if !e.Emit(testID.Unlearned(later, []string{"k"}, testSHA, emitAt)) {
+		t.Error("a new bucket must not inherit the cap")
+	}
+}
+
+// Once the dedupe set is full of live entries, an emit must not scan it:
+// the scan is throttled to once a minute.
+func TestFullDedupeSetIsNotScannedPerEmit(t *testing.T) {
+	e := NewEmitter(nil, testID, 0, t.Logf)
+	now := evTime
+	e.now = func() time.Time { return now }
+	for i := 0; i < maxSeen; i++ {
+		e.seen[strconv.Itoa(i)] = now
+	}
+	e.lastSweep = now
+	ev := events()["file-write"]
+	start := time.Now()
+	for i := 0; i < 2000; i++ {
+		ev.File.Path = "/root/.ssh/k" + strconv.Itoa(i)
+		e.Emit(testID.Finding(ev, learned(), testSHA, emitAt))
+	}
+	if e.sweeps != 0 {
+		t.Errorf("swept %d times within a minute", e.sweeps)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("2000 emits against a full set took %v", d)
+	}
+	now = now.Add(time.Minute)
+	e.Emit(testID.Finding(events()["exec"], learned(), testSHA, emitAt))
+	if e.sweeps != 1 {
+		t.Errorf("sweeps after a minute = %d, want 1", e.sweeps)
+	}
+	if len(e.seen) > maxSeen {
+		t.Errorf("dedupe set grew past its bound: %d", len(e.seen))
+	}
+}
+
+func TestSinkRefusesRedAndNonCanonicalLabels(t *testing.T) {
+	s, err := OpenSink(filepath.Join(t.TempDir(), "n.jsonl"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, l := range []string{"red", "TLP:AMBER", "Amber", "white", ""} {
+		id := testID
+		id.TLP = l
+		if err := s.Write(id.Finding(events()["exec"], learned(), testSHA, emitAt)); err == nil {
+			t.Errorf("sink wrote a row labelled %q", l)
+		}
 	}
 }

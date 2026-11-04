@@ -89,3 +89,12 @@ func TestConcurrentSavesLeaveAWholeFile(t *testing.T) {
 		t.Errorf("temp files left behind: %v", left)
 	}
 }
+
+func TestSyncDir(t *testing.T) {
+	if err := syncDir(t.TempDir()); err != nil {
+		t.Fatalf("fsync of a directory: %v", err)
+	}
+	if err := syncDir(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Error("a missing directory must fail the save")
+	}
+}
