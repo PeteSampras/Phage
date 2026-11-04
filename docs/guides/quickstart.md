@@ -34,8 +34,8 @@ sudo phaged -config /etc/phage/phage.yaml
 ```
 Path flags (`-state`, `-audit`, `-control`) override the file for that run.
 `-mode` may only **lower** the file's mode (e.g. `-mode learn` over an alert
-config); it can never raise it, and `-mode enforce` without `-config` is
-refused. Host-modifying features can be enabled only in the config file.
+config); it can never raise it. Without `-config` the mode is learn, so
+`-mode alert`/`-mode enforce` are refused — put the mode in the file. Host-modifying features can be enabled only in the config file.
 Let it learn for at least a week (`learn_window`). It is building the baseline of
 how your server normally behaves. It will not alert or act in this phase — that
 is correct.

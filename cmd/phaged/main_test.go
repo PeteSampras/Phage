@@ -48,16 +48,17 @@ func TestModeMayNotRaiseTheFile(t *testing.T) {
 	}
 }
 
-func TestEnforceNeedsConfig(t *testing.T) {
-	if _, err := parseOptions([]string{"-mode", "enforce"}, io.Discard); err == nil {
-		t.Error("-mode enforce without -config must be refused")
+// Without -config the mode is the default (learn); -mode may never raise it,
+// so only -mode learn is accepted.
+func TestModeWithoutConfigNeverRaises(t *testing.T) {
+	for _, m := range []string{"enforce", "alert"} {
+		if _, err := parseOptions([]string{"-mode", m}, io.Discard); err == nil {
+			t.Errorf("-mode %s without -config must be refused", m)
+		}
 	}
-	opt, err := parseOptions([]string{"-mode", "alert"}, io.Discard)
-	if err != nil || opt.cfg.Mode != mode.Alert {
-		t.Errorf("-mode alert without -config should run (hand run): %v", err)
-	}
-	if len(opt.cfg.HostModifying()) != 0 {
-		t.Error("a config-less run must arm nothing")
+	opt, err := parseOptions([]string{"-mode", "learn"}, io.Discard)
+	if err != nil || opt.cfg.Mode != mode.Learn || len(opt.cfg.HostModifying()) != 0 {
+		t.Errorf("-mode learn without -config should run, arming nothing: %v", err)
 	}
 }
 
@@ -100,7 +101,7 @@ func TestPathFlagsStillOverride(t *testing.T) {
 	if opt.cfg.StatePath != "/x/b.json" || opt.cfg.ControlPath != "" || opt.cfg.ReleaseAfter != 60 {
 		t.Errorf("overrides not applied: %+v", opt.cfg)
 	}
-	if _, err := parseOptions([]string{"-release-after", "0"}, io.Discard); err == nil {
+	if _, err := parseOptions([]string{"-config", p, "-release-after", "0"}, io.Discard); err == nil {
 		t.Error("-release-after 0 must be refused")
 	}
 }

@@ -12,7 +12,10 @@ Type=simple
 # in the `enforcement:` block of /etc/phage/phage.yaml and only take effect with
 # `mode: enforce`; decoys only via `deception.honeytokens`. No flag can enable
 # them (-heal/-protect/-honeytokens are errors). For an emergency downgrade add
-# `-mode alert` here: phaged starts disarmed and records it in the audit trail.
+# `-mode alert` here: phaged starts disarmed and records it in the audit trail
+# (the config file must still load). phaged fails closed on a broken config or
+# a full /var; with Restart=on-failure that is a crash loop — alert on
+# `systemctl show -p NRestarts phage` or add an OnFailure= unit.
 ExecStart=/usr/local/bin/phaged -config /etc/phage/phage.yaml -bpf /usr/local/lib/phage/sensors.bpf.o
 
 Restart=on-failure

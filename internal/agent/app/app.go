@@ -560,7 +560,9 @@ func (a *App) realArmers(sensor *loader.Sensor) armers {
 			}
 			// The LSM always allows pid 1 and the agent itself; the launcher
 			// slot gets a real pid only when dev.trust_launcher_signals says so
-			// (pid 1 otherwise, which adds nothing).
+			// (pid 1 otherwise, which adds nothing). Unlike isSupervisor, the
+			// slot is FIXED at arm time: if the launcher exits, its pid stays
+			// allowed until restart (documented in FORK.md; dev-only setting).
 			launcher := uint32(1)
 			if a.cfg.Dev.TrustLauncherSignals {
 				launcher = uint32(os.Getppid())

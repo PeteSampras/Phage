@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,8 +32,8 @@ var movedFlags = map[string]string{
 //   - -mode may only LOWER the config file's mode, never raise it; lowering
 //     switches off whatever the lower mode does not allow (an emergency
 //     downgrade starts disarmed rather than refusing to start);
-//   - without -config, -mode enforce is refused (enforcement is configured in
-//     the file and only there).
+//   - without -config the mode is the default, learn, so -mode can only say
+//     learn: -mode alert and -mode enforce are refused (they would raise it).
 func parseOptions(args []string, stderr io.Writer) (options, error) {
 	defaults := config.Default()
 	fs := flag.NewFlagSet("phaged", flag.ContinueOnError)
@@ -77,10 +76,8 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 			return options{}, err
 		}
 		switch {
-		case *configPath == "" && m == mode.Enforce:
-			return options{}, errors.New("-mode enforce requires -config: enforcement is configured in the config file only")
 		case *configPath == "" && m > cfg.Mode:
-			cfg.Mode = m // no file: defaults are learn; alert is allowed for a hand run
+			return options{}, fmt.Errorf("-mode %s requires -config: without a config file the mode is learn, and -mode may only lower it — set mode: %s in a config file", m, m)
 		case m > cfg.Mode:
 			return options{}, fmt.Errorf("-mode %s would raise the config file's mode %s; flags may only lower it", m, cfg.Mode)
 		default:

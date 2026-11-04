@@ -64,11 +64,16 @@ After editing the file, run `systemctl restart phage`.
   `-protect` and `-honeytokens` are now errors, and each error names the config
   key that replaced the flag.
 - `-mode` can only **lower** the config file's mode. It can never raise it.
-  - `-mode enforce` without `-config` is refused.
+  - Without `-config` the mode is the default, `learn`, so `-mode alert` and
+    `-mode enforce` are refused there too. To run in alert by hand, write a
+    config file with `mode: alert`. (`-mode learn` is accepted.)
   - Emergency downgrade: run `phaged -config … -mode alert` (or `learn`). This
     starts with every feature that mode does not allow switched off. It logs an
     `ENFORCEMENT DISARMED` line and writes a `disarmed` audit record. It does
-    not fail on validation, so it cannot crash-loop.
+    not fail on validation of the switched-off keys. **It still needs a config
+    file that loads**: a file with a YAML error, an unknown key or a non-literal
+    boolean stops startup whatever `-mode` says. To recover from a broken file,
+    fix it or point `-config` at a known-good copy.
 
 **How a containment rung falls back**
 
@@ -99,8 +104,28 @@ created 0600.
   - `action`: the rung actually applied;
   - `outcome`: `contained`, `notified`, `skipped:<why>` or `failed:<err>`.
 
-  `phage events` shows the same fields.
-- **Failing to write a startup, arming or disarm record is fatal.**
+  `phage events` shows the same fields. A write by a process that is already
+  contained still gets a response record, with `outcome: already_contained`.
+- **Self-heal records** (`kind: self_heal`), one per heal attempt: `outcome`
+  is `healed`, `unchanged` or `failed:<err>`, along with the `path`, the
+  `evidence` location, and the writer's pid and comm.
+- **Failing to write a startup, arming or disarm record is fatal.** A failed
+  response or self-heal record during the run is only logged.
+
+## What stops phaged from starting (monitor it)
+
+phaged fails closed at startup. Under `Restart=on-failure` (every 5 s) any of
+the following becomes a crash loop that leaves the host **unmonitored**:
+- a full or read-only `/var`: the audit trail cannot be opened, or the startup
+  or arming record cannot be written;
+- a config file that does not load: YAML errors, unknown keys, non-literal
+  booleans, an invalid combination, or a missing file;
+- a removed flag (`-heal`, `-protect`, `-honeytokens`) left in a drop-in;
+- a `-mode` that would raise the file's mode.
+
+Alert on it: watch `systemctl show -p NRestarts,ActiveState phage` (or the
+node-exporter systemd collector), or add an `OnFailure=` unit that pages, and
+alert on disk space for `/var/lib/phage`.
 
 ## What changed and why
 
@@ -136,15 +161,30 @@ docs moved together). `git log 9757354..` lists each commit.
      pruned first, and each prune is logged.
 3. **Self-heal triggered by writes in another mount namespace.** A container
    writing its own `/root/.ssh/authorized_keys` produced the same path as the
-   host's file. *Fix:* the writer's `/proc/<pid>/ns/mnt` must equal
-   `/proc/1/ns/mnt`. If the writer differs or has already exited, the file is
-   not healed; the alert stands, and the reason records the skip.
+   host's file. A mount-namespace comparison (the first fix) was wrong in the
+   other direction: `unshare -Urm sh -c 'echo k >> ~/.ssh/authorized_keys'`
+   is in a new namespace but still writes the host inode, so it was alerted
+   and never healed. *Fix:* the path is resolved inside the writer's root
+   (`/proc/<pid>/root`, `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)`).
+   - If that is the host file's dev+ino, the heal runs.
+   - If it is a different file (the container's own copy), the host file is
+     not touched, and the response reason records the skip.
+   - If the writer has exited or its view cannot be read, the heal runs and
+     the host file's own content decides: Heal compares the file with its
+     snapshot and does nothing if it is unchanged, which is the case when a
+     container wrote only its private copy.
+
+   Writes that arrive during a running heal set a dirty bit, so the heal runs
+   once more rather than missing them. Every heal attempt is audited.
 4. **MEDIUM: trust was based on `comm`, which the attacker controls.**
    - The agent now recognises itself by its own tgid.
    - Only **pid 1** counts as the supervisor. The launcher is trusted only when
      `dev.trust_launcher_signals: true` is set, and it is re-read with
      `getppid` at decision time. The self-protect LSM's launcher slot is set to
-     pid 1 unless that setting is on.
+     pid 1 unless that setting is on; when it is on, the slot is **fixed at arm
+     time** to the parent at that moment, and is not re-read. If the launcher
+     exits, its pid stays allowed to signal the agent until phaged restarts.
+     This is one more reason the setting is for hand runs only.
    - sshd is recognised by identity. The inode of `/proc/<pid>/exe` must be one
      of the installed sshd binaries; these are resolved at startup, and again on
      a miss so package upgrades are picked up. An unlinked listed binary
@@ -210,11 +250,15 @@ mean to use it by hand.
   the kernel's `dev_t` encoding. The objects compile here (clang, libbpf 1.3,
   vmlinux.h from `bpftool btf dump`), but this sandbox refuses BPF loads
   (EPERM), so the change could not be verified and was not made.
-- **Self-heal misses short-lived writers.** The mount-namespace check runs when
-  userspace processes the event, so a writer that has already exited (for
-  example `cat >> file`) is not healed; it is still alerted. Capturing the mount
-  namespace inode in-kernel would fix this, but needs a BPF change, which was
-  not made for the same reason.
+- **Self-heal for a writer that has already exited relies on content.** If the
+  writer has gone (for example `cat >> file`), its view of the path cannot be
+  checked, so the heal runs whenever the host file differs from its snapshot.
+  A container's private write cannot change the host file, so it is not
+  reverted. But a host edit that scored below `contain`, followed by a
+  high-scoring write from a writer that has already exited, is reverted along
+  with the attacker's write (see the next item). Recording the written inode
+  in-kernel would remove this, but needs a BPF change, which was not made for
+  the same reason.
 - **Snapshots are fixed at startup.** A legitimate edit to a sentinel (one that
   scored below `contain`) is not folded into the snapshot. If a later write to
   the same file scores high, the heal restores the *startup* content and undoes

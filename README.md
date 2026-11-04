@@ -289,8 +289,10 @@ and `-honeytokens` flags are now errors naming the config key that replaced
 them. `-mode` may only *lower* the config file's mode: in an emergency,
 `phaged -config /etc/phage/phage.yaml -mode alert` starts with every
 enforcement feature disarmed, logs `ENFORCEMENT DISARMED` and writes a
-`disarmed` audit record, instead of refusing to start. `-mode enforce` without
-`-config` is refused.
+`disarmed` audit record, instead of refusing to start; the config file must
+still load. Without `-config` the mode is learn and `-mode` cannot raise it.
+phaged fails closed on a full `/var` or a broken config — monitor
+`phage.service` restarts (see [FORK.md](FORK.md)).
 
 To remove everything: `sudo make uninstall` from the clone — it keeps your config
 and baseline unless you also delete `/etc/phage` and `/var/lib/phage`.
